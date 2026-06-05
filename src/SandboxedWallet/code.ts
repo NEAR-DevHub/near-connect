@@ -219,6 +219,15 @@ async function getIframeCode(args: { id: string; executor: SandboxExecutor; code
             return window.selector.call("walletConnect.getSession", {});
           },
         },
+
+        ethereum: {
+          isAvailable() {
+            return window.selector.call("ethereum.isAvailable", {});
+          },
+          request(params) {
+            return window.selector.call("ethereum.request", params);
+          },
+        },
       
         async ready(wallet) {
           wallet.manifest = ${JSON.stringify(manifest)};

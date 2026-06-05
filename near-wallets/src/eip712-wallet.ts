@@ -303,6 +303,24 @@ function buildProof(msg: WalletRequestMessage, ethSignatureHex: string): string 
 let modal: InstanceType<typeof WalletConnectModal>;
 
 async function wcConnect(): Promise<{ address: string }> {
+  // Browser-extension fast path: skip the WalletConnect modal and ask the
+  // injected provider for an account directly.
+  if (await ethereumBridgeAvailable()) {
+    showPendingUI("Confirm in your wallet");
+    try {
+      const accounts: string[] = await (window.selector as any).ethereum.request({
+        method: "eth_requestAccounts",
+        params: [],
+      });
+      const address = accounts?.[0];
+      if (!address) throw new Error("No Ethereum account");
+      return { address };
+    } finally {
+      // Don't hide — caller follows up with another wcRequest that
+      // re-renders the pending UI.
+    }
+  }
+
   window.selector.ui.showIframe();
 
   // Loading spinner
@@ -403,7 +421,29 @@ function hidePendingUI() {
   window.selector.ui.hideIframe();
 }
 
+// If the top-level page has a browser-extension Ethereum provider (e.g.
+// MetaMask), the parent exposes it via `window.selector.ethereum` — the
+// iframe can't see `window.ethereum` directly because of the sandbox. The
+// bridge is JSON-RPC only (forwarded `request({method, params})` calls),
+// which preserves the iframe isolation.
+let _ethereumBridgeAvailable: boolean | null = null;
+async function ethereumBridgeAvailable(): Promise<boolean> {
+  if (_ethereumBridgeAvailable !== null) return _ethereumBridgeAvailable;
+  try {
+    _ethereumBridgeAvailable = await (window.selector as any).ethereum?.isAvailable?.() === true;
+  } catch {
+    _ethereumBridgeAvailable = false;
+  }
+  return _ethereumBridgeAvailable;
+}
+
 async function wcRequest(method: string, params: any[]): Promise<any> {
+  // Prefer the injected provider if available — same JSON-RPC surface,
+  // direct path, no WalletConnect round-trip.
+  if (await ethereumBridgeAvailable()) {
+    return (window.selector as any).ethereum.request({ method, params });
+  }
+
   const session = await window.selector.walletConnect.getSession();
   if (!session) throw new Error("WalletConnect not connected");
   const request = window.selector.walletConnect.request({
@@ -424,6 +464,12 @@ async function wcRequest(method: string, params: any[]): Promise<any> {
 }
 
 async function wcDisconnect() {
+  if (await ethereumBridgeAvailable()) {
+    // Extension providers have no "disconnect" RPC the dApp can drive —
+    // just clearing local state is enough; the user manages the
+    // connection from the extension UI.
+    return;
+  }
   const session = await window.selector.walletConnect.getSession();
   if (session) {
     await window.selector.walletConnect.disconnect({
@@ -749,6 +795,17 @@ const Eip712Wallet = async () => {
 
   /** Ensure WalletConnect is connected. Returns the ETH address. */
   async function ensureConnected(): Promise<string> {
+    // Browser-extension path doesn't have a WC session to validate against.
+    // A stored `ethAddress` is trusted until the user logs out — the
+    // extension itself rejects requests if the account changes.
+    if (await ethereumBridgeAvailable()) {
+      if (ethAddress) return ethAddress;
+      const { address } = await wcConnect();
+      ethAddress = address;
+      window.localStorage.setItem(STORAGE_KEY_ETH_ADDRESS, address);
+      return address;
+    }
+
     // A stale `ethAddress` may persist in localStorage / closure after the
     // WalletConnect session has been torn down (e.g. by the "Use a different
     // wallet" button, or by the peer wallet disconnecting). Re-pair unless
