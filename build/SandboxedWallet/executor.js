@@ -29,10 +29,30 @@ class SandboxExecutor {
         }
         if (action === "allowsOpen") {
             const openUrl = (0, url_1.parseUrl)(params?.url || "");
+            if (!openUrl)
+                return false;
+            // WalletConnect needs to deeplink into arbitrary wallet apps via
+            // both custom schemes (`ledgerlive:`, `metamask:`, `rainbow:`, …)
+            // and web entry points (`https://console.fireblocks.io/v2/wc?...`,
+            // `https://link.metamask.io/...`, etc.). Enumerating every wallet
+            // is unmaintainable, so a wallet granted the `walletConnect`
+            // permission may open any URL except known-dangerous schemes.
+            const DANGEROUS_SCHEMES = new Set(["javascript:", "data:", "blob:", "file:", "about:"]);
+            if (DANGEROUS_SCHEMES.has(openUrl.protocol.toLowerCase()))
+                return false;
+            if (this.manifest.permissions.walletConnect === true)
+                return true;
             const allowsOpen = this.manifest.permissions.allowsOpen;
-            if (!openUrl || !allowsOpen || !Array.isArray(allowsOpen) || allowsOpen.length === 0)
+            if (!allowsOpen || !Array.isArray(allowsOpen) || allowsOpen.length === 0)
                 return false;
             const isAllowed = allowsOpen.some((path) => {
+                // Protocol-only patterns like "wc:" or "metamask:" allow any URL
+                // with that scheme. Needed for WalletConnect deeplinks: the spec
+                // pairing URI is `wc:<topic>?...` which `new URL("wc:")` rejects,
+                // so a plain `new URL(path)` comparison would never match.
+                if (/^[a-z][a-z0-9+.-]*:$/i.test(path)) {
+                    return openUrl.protocol.toLowerCase() === path.toLowerCase();
+                }
                 const url = (0, url_1.parseUrl)(path);
                 if (!url)
                     return false;
