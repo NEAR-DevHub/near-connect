@@ -17,7 +17,11 @@ import {
 } from "./types";
 import { NearConnector } from "./NearConnector";
 import { nearActionsToConnectorActions } from "./actions";
-import { defaultResolveAuthViaSignMessage, polyfillSignInAndSignMessage } from "./helpers/resolveAuth";
+import {
+  defaultResolveAuthViaSignMessage,
+  isResolveAuthMethodNotFound,
+  polyfillSignInAndSignMessage,
+} from "./helpers/resolveAuth";
 
 export class InjectedWallet implements NearWalletBase {
   constructor(
@@ -101,7 +105,14 @@ export class InjectedWallet implements NearWalletBase {
   async resolveAuth(params: ResolveAuthParams): Promise<ResolveAuthResponse> {
     const args = { ...params, network: params.network ?? this.connector.network };
     if (this.manifest.features?.resolveAuth === true && this.wallet.resolveAuth) {
-      return this.wallet.resolveAuth(args);
+      try {
+        return await this.wallet.resolveAuth(args);
+      } catch (e) {
+        // See SandboxedWallet.resolveAuth — fall through to the default
+        // signMessage-based impl when the injected wallet reports the
+        // method isn't implemented.
+        if (!isResolveAuthMethodNotFound(e)) throw e;
+      }
     }
     return defaultResolveAuthViaSignMessage(this, args);
   }

@@ -89,7 +89,16 @@ class ParentFrameWallet {
     async resolveAuth(params) {
         const args = { ...params, network: params.network ?? this.connector.network };
         if (this.manifest.features?.resolveAuth === true) {
-            return this.callParentFrame("near:resolveAuth", args);
+            try {
+                return (await this.callParentFrame("near:resolveAuth", args));
+            }
+            catch (e) {
+                // See SandboxedWallet.resolveAuth — fall through to the default
+                // signMessage-based impl when the parent frame reports the method
+                // isn't implemented.
+                if (!(0, resolveAuth_1.isResolveAuthMethodNotFound)(e))
+                    throw e;
+            }
         }
         return (0, resolveAuth_1.defaultResolveAuthViaSignMessage)(this, args);
     }

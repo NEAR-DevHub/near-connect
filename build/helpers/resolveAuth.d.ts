@@ -26,3 +26,13 @@ export declare function defaultResolveAuthViaSignMessage(wallet: Pick<NearWallet
  * newly-connected account. Two user gestures instead of one.
  */
 export declare function polyfillSignInAndSignMessage(wallet: Pick<NearWalletBase, "signIn" | "signMessage">, data: SignInAndSignMessageParams): Promise<AccountWithSignedMessage[]>;
+/**
+ * Detects the "method not found" signal from a wallet's native `resolveAuth`
+ * attempt. The sandbox executor rejects with the literal string
+ * `"Method not found"` when the wallet code doesn't implement the method;
+ * injected/parent-frame wallets surface the same condition via an `Error`
+ * with a similar message. Used by the wrappers to fall through to the
+ * default signMessage-based implementation even when the manifest claims
+ * `resolveAuth: true`.
+ */
+export declare function isResolveAuthMethodNotFound(e: unknown): boolean;

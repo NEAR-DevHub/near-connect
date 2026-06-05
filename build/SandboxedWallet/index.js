@@ -73,7 +73,17 @@ class SandboxWallet {
     async resolveAuth(params) {
         const args = { ...params, network: params.network ?? this.connector.network };
         if (this.manifest.features?.resolveAuth === true) {
-            return this.executor.call("wallet:resolveAuth", args);
+            try {
+                return await this.executor.call("wallet:resolveAuth", args);
+            }
+            catch (e) {
+                // Manifest may advertise `resolveAuth: true` for a wallet that hasn't
+                // implemented it natively — that's the signal that the default
+                // signMessage-based fallback is acceptable. Only swallow the specific
+                // "method not found" signal; any other error is a real failure.
+                if (!(0, resolveAuth_1.isResolveAuthMethodNotFound)(e))
+                    throw e;
+            }
         }
         return (0, resolveAuth_1.defaultResolveAuthViaSignMessage)(this, args);
     }
