@@ -12,9 +12,12 @@ import {
   type AccountWithSignedMessage,
   type SignInAndSignMessageParams,
   type SignInParams,
+  type ResolveAuthParams,
+  type ResolveAuthResponse,
 } from "../types";
 import { NearConnector } from "../NearConnector";
 import { nearActionsToConnectorActions } from "../actions";
+import { defaultResolveAuthViaSignMessage, polyfillSignInAndSignMessage } from "../helpers/resolveAuth";
 import SandboxExecutor from "./executor";
 
 export class SandboxWallet {
@@ -35,11 +38,15 @@ export class SandboxWallet {
   }
 
   async signInAndSignMessage(data: SignInAndSignMessageParams): Promise<Array<AccountWithSignedMessage>> {
-    return this.executor.call("wallet:signInAndSignMessage", {
-      network: data?.network ?? this.connector.network,
-      addFunctionCallKey: data?.addFunctionCallKey,
-      messageParams: data.messageParams,
-    });
+    const network = data?.network ?? this.connector.network;
+    if (this.manifest.features?.signInAndSignMessage === true) {
+      return this.executor.call("wallet:signInAndSignMessage", {
+        network,
+        addFunctionCallKey: data?.addFunctionCallKey,
+        messageParams: data.messageParams,
+      });
+    }
+    return polyfillSignInAndSignMessage(this, { ...data, network });
   }
 
   async signOut(data?: { network?: Network }): Promise<void> {
@@ -84,6 +91,14 @@ export class SandboxWallet {
       network: params.network ?? this.connector.network,
     };
     return this.executor.call("wallet:signDelegateActions", args);
+  }
+
+  async resolveAuth(params: ResolveAuthParams): Promise<ResolveAuthResponse> {
+    const args = { ...params, network: params.network ?? this.connector.network };
+    if (this.manifest.features?.resolveAuth === true) {
+      return this.executor.call("wallet:resolveAuth", args);
+    }
+    return defaultResolveAuthViaSignMessage(this, args);
   }
 }
 
