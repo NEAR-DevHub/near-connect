@@ -53,7 +53,7 @@ export interface NearConnectorOptions {
 }
 
 const defaultManifests = [
-  "https://raw.githubusercontent.com/NEAR-DevHub/near-selector/refs/heads/eip712/repository/manifest.json",
+  "https://raw.githubusercontent.com/NEAR-DevHub/near-connect/refs/heads/eip712/repository/manifest.json",
   "https://raw.githubusercontent.com/hot-dao/near-selector/refs/heads/main/repository/manifest.json",
   "https://cdn.jsdelivr.net/gh/azbang/hot-connector/repository/manifest.json",
 ];
