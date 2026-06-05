@@ -304,21 +304,15 @@ let modal: InstanceType<typeof WalletConnectModal>;
 
 async function wcConnect(): Promise<{ address: string }> {
   // Browser-extension fast path: skip the WalletConnect modal and ask the
-  // injected provider for an account directly.
+  // injected provider for an account directly. wcRequest handles the
+  // EIP-1193 4100 "unauthorized" disable + clear path itself, so a
+  // post-revoke retry will flow through the WalletConnect branch instead.
   if (await ethereumBridgeAvailable()) {
     showPendingUI("Confirm in your wallet");
-    try {
-      const accounts: string[] = await (window.selector as any).ethereum.request({
-        method: "eth_requestAccounts",
-        params: [],
-      });
-      const address = accounts?.[0];
-      if (!address) throw new Error("No Ethereum account");
-      return { address };
-    } finally {
-      // Don't hide — caller follows up with another wcRequest that
-      // re-renders the pending UI.
-    }
+    const accounts: string[] = await wcRequest("eth_requestAccounts", []);
+    const address = accounts?.[0];
+    if (!address) throw new Error("No Ethereum account");
+    return { address };
   }
 
   window.selector.ui.showIframe();
@@ -388,6 +382,10 @@ function showPendingUI(message = "Confirm in your wallet") {
   window.selector.ui.showIframe();
   const root = document.getElementById("root")!;
   root.style.display = "flex";
+  // Offer the "Use browser extension" button only when the WalletConnect
+  // path is active AND the page actually has a detected extension provider.
+  const showUseExtension = _ethereumBridgeAvailable === false && _ethereumProviderDetected;
+  const btnStyle = "margin-top:8px;padding:8px 16px;border-radius:8px;border:1px solid #404040;background:transparent;color:#a3a3a3;cursor:pointer;font-family:-apple-system,sans-serif;font-size:13px;";
   root.innerHTML = `
     <div class="prompt-container">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="60" height="60" style="display:block;margin:0 auto 12px">
@@ -396,18 +394,36 @@ function showPendingUI(message = "Confirm in your wallet") {
         </circle>
       </svg>
       <p>${message}</p>
-      <button id="eip712-switch-wallet-btn"
-        style="margin-top:16px;padding:8px 16px;border-radius:8px;border:1px solid #404040;background:transparent;color:#a3a3a3;cursor:pointer;font-family:-apple-system,sans-serif;font-size:13px;">
-        Use a different wallet
-      </button>
+      <button id="eip712-switch-wallet-btn" style="${btnStyle}">Use a different wallet</button>
+      ${showUseExtension ? `<button id="eip712-use-extension-btn" style="${btnStyle}">Use browser extension</button>` : ""}
     </div>`;
   document.getElementById("eip712-switch-wallet-btn")?.addEventListener("click", onSwitchWalletClick);
+  document.getElementById("eip712-use-extension-btn")?.addEventListener("click", onUseExtensionClick);
+}
+
+async function onUseExtensionClick() {
+  // Switch back from WalletConnect to the browser extension. Re-enables
+  // the bridge in the parent and aborts the in-flight WC request so the
+  // caller's retry takes the bridge path.
+  try { await (window.selector as any).ethereum.enable(); } catch {}
+  _ethereumBridgeAvailable = null;
+  try { await wcDisconnect(); } catch {}
+  _clearWalletState?.();
+  _pendingCancel?.(new Error("User switched to browser extension"));
 }
 
 async function onSwitchWalletClick() {
   // Tear down the current WalletConnect session + saved state so the next
-  // request opens the wallet picker fresh.
-  try { await wcDisconnect(); } catch {}
+  // request opens the wallet picker fresh. On the browser-extension bridge
+  // path the user typically wants to leave the extension behind entirely
+  // (e.g. pick Fireblocks via WalletConnect) — disable the bridge so the
+  // next attempt opens the WC modal.
+  if (await ethereumBridgeAvailable()) {
+    try { await (window.selector as any).ethereum.disable(); } catch {}
+    _ethereumBridgeAvailable = false;
+  } else {
+    try { await wcDisconnect(); } catch {}
+  }
   _clearWalletState?.();
   // Abort the in-flight wcRequest so the caller can surface a clean failure
   // and the user can re-trigger the action against a different wallet.
@@ -437,20 +453,43 @@ async function ethereumBridgeAvailable(): Promise<boolean> {
   return _ethereumBridgeAvailable;
 }
 
+// Whether any browser-extension provider is detected on the page, ignoring
+// the bridge-disabled flag. Lets the WalletConnect spinner show a
+// "Use browser extension" affordance for users who switched away earlier.
+let _ethereumProviderDetected = false;
+async function ethereumProviderDetected(): Promise<boolean> {
+  try {
+    return (await (window.selector as any).ethereum?.detected?.()) === true;
+  } catch {
+    return false;
+  }
+}
+
+// EIP-1193: 4100 = unauthorized; the user revoked the site or never
+// approved it. We use this to know the bridge can't deliver on this page
+// and the iframe should fall back to WalletConnect.
+function isUnauthorizedError(e: any): boolean {
+  if (!e) return false;
+  if (e.code === 4100) return true;
+  const msg = (typeof e.message === "string" ? e.message : "").toLowerCase();
+  return msg.includes("not been authorized") || msg.includes("not authorized");
+}
+
 async function wcRequest(method: string, params: any[]): Promise<any> {
   // Prefer the injected provider if available — same JSON-RPC surface,
   // direct path, no WalletConnect round-trip.
-  if (await ethereumBridgeAvailable()) {
-    return (window.selector as any).ethereum.request({ method, params });
-  }
-
-  const session = await window.selector.walletConnect.getSession();
-  if (!session) throw new Error("WalletConnect not connected");
-  const request = window.selector.walletConnect.request({
-    topic: session.topic,
-    chainId: "eip155:1",
-    request: { method, params },
-  });
+  const useBridge = await ethereumBridgeAvailable();
+  const request = useBridge
+    ? (window.selector as any).ethereum.request({ method, params })
+    : (async () => {
+        const session = await window.selector.walletConnect.getSession();
+        if (!session) throw new Error("WalletConnect not connected");
+        return window.selector.walletConnect.request({
+          topic: session.topic,
+          chainId: "eip155:1",
+          request: { method, params },
+        });
+      })();
   // Race against the "switch wallet" button on the pending UI.
   const prevCancel = _pendingCancel;
   const cancellable = new Promise<never>((_, reject) => {
@@ -458,6 +497,16 @@ async function wcRequest(method: string, params: any[]): Promise<any> {
   });
   try {
     return await Promise.race([request, cancellable]);
+  } catch (e: any) {
+    // User revoked the site permission in the extension (EIP-1193 code
+    // 4100) — disable the bridge + drop the stale stored ETH address so
+    // the next attempt opens the WalletConnect modal with a clean state.
+    if (useBridge && isUnauthorizedError(e)) {
+      try { await (window.selector as any).ethereum.disable(); } catch {}
+      _ethereumBridgeAvailable = false;
+      _clearWalletState?.();
+    }
+    throw e;
   } finally {
     _pendingCancel = prevCancel;
   }
@@ -700,6 +749,8 @@ async function signMessageViaEthereum(
 // ─── Wallet Implementation ──────────────────────────────────────────────────
 
 const Eip712Wallet = async () => {
+  _ethereumProviderDetected = await ethereumProviderDetected();
+
   let ethAddress: string | null = null;
   let publicKey64: Uint8Array | null = null;
   let accountId: string | null = null;
