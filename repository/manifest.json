@@ -19,6 +19,7 @@
         "signAndSendTransaction": true,
         "signAndSendTransactions": true,
         "signDelegateActions": true,
+        "resolveAuth": true,
         "mainnet": true,
         "testnet": true
       },
@@ -80,7 +81,8 @@
         "signMessage": true,
         "signInWithoutAddKey": true,
         "signAndSendTransaction": true,
-        "signAndSendTransactions": true
+        "signAndSendTransactions": true,
+        "resolveAuth": true
       },
 
       "permissions": {
@@ -114,6 +116,7 @@
         "signAndSendTransactions": true,
         "signInWithFunctionCallKey": true,
         "signDelegateActions": true,
+        "resolveAuth": true,
         "mainnet": true,
         "testnet": true
       },
@@ -148,6 +151,7 @@
         "signAndSendTransaction": true,
         "signAndSendTransactions": true,
         "signInWithoutAddKey": true,
+        "resolveAuth": true,
         "verifyOwner": false,
         "testnet": true,
         "signDelegateActions": true,
@@ -189,6 +193,7 @@
         "signAndSendTransaction": true,
         "signAndSendTransactions": true,
         "signDelegateActions": true,
+        "resolveAuth": true,
         "mainnet": true,
         "testnet": true
       },
@@ -219,7 +224,8 @@
         "signInAndSignMessage": true,
         "signInWithFunctionCallKey": true,
         "signAndSendTransaction": true,
-        "signAndSendTransactions": true
+        "signAndSendTransactions": true,
+        "resolveAuth": true
       },
 
       "permissions": {
@@ -258,7 +264,8 @@
         "signInAndSignMessage": true,
         "signInWithFunctionCallKey": true,
         "signAndSendTransaction": true,
-        "signAndSendTransactions": true
+        "signAndSendTransactions": true,
+        "resolveAuth": true
       }
     },
     {
@@ -279,6 +286,7 @@
         "signAndSendTransaction": true,
         "signAndSendTransactions": true,
         "signDelegateActions": true,
+        "resolveAuth": true,
         "verifyOwner": false,
         "mainnet": true,
         "testnet": false
@@ -345,6 +353,7 @@
         "signInWithFunctionCallKey": true,
         "signAndSendTransaction": true,
         "signAndSendTransactions": true,
+        "resolveAuth": true,
         "testnet": true
       }
     },
@@ -371,6 +380,7 @@
         "signInWithFunctionCallKey": true,
         "signAndSendTransaction": true,
         "signAndSendTransactions": true,
+        "resolveAuth": true,
         "testnet": true
       }
     },
@@ -401,6 +411,7 @@
         "signInWithFunctionCallKey": true,
         "signAndSendTransaction": true,
         "signAndSendTransactions": true,
+        "resolveAuth": true,
         "testnet": true
       }
     }, 
@@ -422,6 +433,7 @@
         "signAndSendTransactions": true,
         "signDelegateActions": true,
         "signInWithFunctionCallKey": true,
+        "resolveAuth": true,
         "mainnet": true,
         "testnet": true
       },
