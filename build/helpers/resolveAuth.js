@@ -2,6 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.defaultResolveAuthViaSignMessage = defaultResolveAuthViaSignMessage;
 exports.polyfillSignInAndSignMessage = polyfillSignInAndSignMessage;
+exports.isResolveAuthMethodNotFound = isResolveAuthMethodNotFound;
 /**
  * NEP-641 default `resolveAuth` implementation, built on top of NEP-413
  * `signMessage`. Per NEP-641 §"NEP-413 fallback", the `purpose` is bound
@@ -79,5 +80,23 @@ function bytesToBase64(bytes) {
     for (const b of bytes)
         s += String.fromCharCode(b);
     return btoa(s);
+}
+/**
+ * Detects the "method not found" signal from a wallet's native `resolveAuth`
+ * attempt. The sandbox executor rejects with the literal string
+ * `"Method not found"` when the wallet code doesn't implement the method;
+ * injected/parent-frame wallets surface the same condition via an `Error`
+ * with a similar message. Used by the wrappers to fall through to the
+ * default signMessage-based implementation even when the manifest claims
+ * `resolveAuth: true`.
+ */
+function isResolveAuthMethodNotFound(e) {
+    const probe = typeof e === "string"
+        ? e
+        : typeof e?.message === "string"
+            ? e.message
+            : "";
+    const lower = probe.toLowerCase();
+    return lower.includes("method not found") || lower.includes("methodnotfound");
 }
 //# sourceMappingURL=resolveAuth.js.map
