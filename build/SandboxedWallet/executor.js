@@ -7,6 +7,61 @@ const url_1 = require("../helpers/url");
 const uuid_1 = require("../helpers/uuid");
 const iframe_1 = __importDefault(require("./iframe"));
 const cacheId = (0, uuid_1.uuid4)();
+// ─── Injected Ethereum provider discovery ────────────────────────────────────
+// Used by the `ethereum.*` bridge so sandboxed wallets (e.g. eip712-wallet)
+// can talk to browser-extension wallets without breaking iframe isolation —
+// only JSON-RPC `request({method, params})` crosses the boundary.
+//
+// Two discovery channels:
+//   1. Legacy: `window.ethereum` (single global).
+//   2. EIP-6963: providers dispatch `eip6963:announceProvider` in response
+//      to a page-emitted `eip6963:requestProvider`. Required for MetaMask
+//      and any other provider that no longer injects the legacy global.
+const _eip6963Providers = [];
+let _eip6963ListenerInstalled = false;
+function installEip6963Listener() {
+    if (typeof window === "undefined" || _eip6963ListenerInstalled)
+        return;
+    _eip6963ListenerInstalled = true;
+    window.addEventListener("eip6963:announceProvider", (event) => {
+        const provider = event?.detail?.provider;
+        if (provider && !_eip6963Providers.includes(provider))
+            _eip6963Providers.push(provider);
+    });
+    // Prompt any provider that's already loaded to re-announce. Per EIP-6963
+    // the wallet listens for this and re-dispatches `eip6963:announceProvider`.
+    window.dispatchEvent(new CustomEvent("eip6963:requestProvider"));
+}
+if (typeof window !== "undefined")
+    installEip6963Listener();
+function pickEthereumProvider() {
+    // Prefer EIP-6963 (multi-provider safe). Fall back to the legacy global
+    // `window.ethereum`, re-reading on each call so we don't cache a stale
+    // null from a load order race.
+    if (_eip6963Providers.length > 0)
+        return _eip6963Providers[0];
+    if (typeof window !== "undefined" && window.ethereum)
+        return window.ethereum;
+    return null;
+}
+async function waitForEthereumProvider(timeoutMs = 800) {
+    installEip6963Listener();
+    const existing = pickEthereumProvider();
+    if (existing)
+        return existing;
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+        // Re-emit periodically — some providers attach the listener late.
+        if (typeof window !== "undefined") {
+            window.dispatchEvent(new CustomEvent("eip6963:requestProvider"));
+        }
+        await new Promise((r) => setTimeout(r, 100));
+        const found = pickEthereumProvider();
+        if (found)
+            return found;
+    }
+    return null;
+}
 class SandboxExecutor {
     connector;
     manifest;
@@ -317,6 +372,33 @@ class SandboxExecutor {
             }
             catch (e) {
                 failed(e instanceof Error ? e.message : String(e));
+            }
+            return;
+        }
+        // Bridge to a browser-extension Ethereum provider (e.g. MetaMask). The
+        // provider injects `window.ethereum` into the top-level page only — the
+        // sandboxed iframe can't see it. Forwarding requests preserves the
+        // iframe isolation: the executor never gets direct access to the
+        // provider object, only the proxied JSON-RPC responses.
+        if (event.data.method === "ethereum.isAvailable") {
+            this.assertPermissions(iframe, "walletConnect", event);
+            const eth = await waitForEthereumProvider();
+            success(!!eth && typeof eth.request === "function");
+            return;
+        }
+        if (event.data.method === "ethereum.request") {
+            this.assertPermissions(iframe, "walletConnect", event);
+            const eth = await waitForEthereumProvider();
+            if (!eth || typeof eth.request !== "function") {
+                failed("No injected Ethereum provider available");
+                return;
+            }
+            try {
+                const result = await eth.request(event.data.params);
+                success(result);
+            }
+            catch (e) {
+                failed({ message: e?.message ?? String(e), code: e?.code });
             }
             return;
         }
