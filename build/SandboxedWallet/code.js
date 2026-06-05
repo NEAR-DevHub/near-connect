@@ -224,6 +224,18 @@ async function getIframeCode(args) {
           request(params) {
             return window.selector.call("ethereum.request", params);
           },
+          next() {
+            return window.selector.call("ethereum.next", {});
+          },
+          disable() {
+            return window.selector.call("ethereum.disable", {});
+          },
+          enable() {
+            return window.selector.call("ethereum.enable", {});
+          },
+          detected() {
+            return window.selector.call("ethereum.detected", {});
+          },
         },
       
         async ready(wallet) {

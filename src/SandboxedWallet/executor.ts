@@ -19,6 +19,15 @@ const cacheId = uuid4();
 //      and any other provider that no longer injects the legacy global.
 const _eip6963Providers: any[] = [];
 let _eip6963ListenerInstalled = false;
+// Index of the provider currently exposed via `pickEthereumProvider()`.
+// Advanced by `ethereum.next` so the iframe's "Use a different wallet"
+// button can rotate through detected providers.
+let _eip6963ProviderIndex = 0;
+// Set when the iframe explicitly opts out of the injected-provider bridge
+// (user picked "Use a different wallet" with no more rotations, or the
+// extension revoked permission). The bridge then reports unavailable and
+// the iframe falls back to its WalletConnect path.
+let _ethereumBridgeDisabled = false;
 
 function installEip6963Listener(): void {
   if (typeof window === "undefined" || _eip6963ListenerInstalled) return;
@@ -38,7 +47,9 @@ function pickEthereumProvider(): any {
   // Prefer EIP-6963 (multi-provider safe). Fall back to the legacy global
   // `window.ethereum`, re-reading on each call so we don't cache a stale
   // null from a load order race.
-  if (_eip6963Providers.length > 0) return _eip6963Providers[0];
+  if (_eip6963Providers.length > 0) {
+    return _eip6963Providers[_eip6963ProviderIndex % _eip6963Providers.length];
+  }
   if (typeof window !== "undefined" && (window as any).ethereum) return (window as any).ethereum;
   return null;
 }
@@ -393,6 +404,48 @@ class SandboxExecutor {
     // iframe isolation: the executor never gets direct access to the
     // provider object, only the proxied JSON-RPC responses.
     if (event.data.method === "ethereum.isAvailable") {
+      this.assertPermissions(iframe, "walletConnect", event);
+      if (_ethereumBridgeDisabled) { success(false); return; }
+      const eth = await waitForEthereumProvider();
+      success(!!eth && typeof eth.request === "function");
+      return;
+    }
+
+    // Rotate to the next detected EIP-6963 provider. Triggered by the
+    // "Use a different wallet" button in sandboxed wallets so the user can
+    // switch between multiple installed extensions without reloading.
+    if (event.data.method === "ethereum.next") {
+      this.assertPermissions(iframe, "walletConnect", event);
+      if (_eip6963Providers.length > 1) {
+        _eip6963ProviderIndex = (_eip6963ProviderIndex + 1) % _eip6963Providers.length;
+      }
+      success(_eip6963Providers.length > 1);
+      return;
+    }
+
+    // Opt out of the injected-provider bridge entirely for the rest of the
+    // session, so the iframe falls back to WalletConnect (e.g. user wants
+    // Fireblocks instead of MetaMask, or revoked the extension's auth).
+    if (event.data.method === "ethereum.disable") {
+      this.assertPermissions(iframe, "walletConnect", event);
+      _ethereumBridgeDisabled = true;
+      success(null);
+      return;
+    }
+
+    // Re-enable the bridge after a previous `disable`. Used when the user
+    // wants to switch back from WalletConnect to the browser extension.
+    if (event.data.method === "ethereum.enable") {
+      this.assertPermissions(iframe, "walletConnect", event);
+      _ethereumBridgeDisabled = false;
+      success(null);
+      return;
+    }
+
+    // Reports whether any extension provider was ever detected on the
+    // page. Honest even when the bridge is currently disabled, so the
+    // iframe can offer the "Use browser extension" affordance.
+    if (event.data.method === "ethereum.detected") {
       this.assertPermissions(iframe, "walletConnect", event);
       const eth = await waitForEthereumProvider();
       success(!!eth && typeof eth.request === "function");
