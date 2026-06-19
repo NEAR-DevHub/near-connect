@@ -13,6 +13,7 @@ declare class IframeExecutor {
     show(): void;
     hide(): void;
     postMessage(data: any): void;
+    get contentWindow(): Window | null;
     dispose(): void;
 }
 export default IframeExecutor;

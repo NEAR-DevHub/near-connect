@@ -76,6 +76,9 @@ class IframeExecutor {
             throw new Error("Iframe not loaded");
         this.iframe.contentWindow.postMessage({ ...data, origin: this.origin }, "*");
     }
+    get contentWindow() {
+        return this.iframe.contentWindow;
+    }
     dispose() {
         window.removeEventListener("message", this.handler);
         this.popup.destroy();
