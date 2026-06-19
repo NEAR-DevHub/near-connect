@@ -305,26 +305,32 @@ class SandboxExecutor {
       const panel = window.open(event.data.params.url, "_blank", event.data.params.features);
       const panelId = panel ? uuid4() : null;
 
-      const handler = (ev: MessageEvent) => {
-        const url = parseUrl(event.data.params.url);
-        if (url && url.origin === ev.origin) {
-          iframe.postMessage(ev.data);
-        }
-      };
-
       success(panelId);
-      window.addEventListener("message", handler);
 
+      // Only register the cross-window message forwarder when `window.open`
+      // actually returned a real popup. Deeplinks (`ledgerlive://`,
+      // `metamask://`, …) return `null` from `window.open` and have
+      // `new URL(deeplink).origin === "null"` — which would otherwise
+      // match the sandboxed iframe's own `ev.origin === "null"`, echoing
+      // every outgoing iframe message back to itself and corrupting the
+      // selector.call response routing.
       if (panel && panelId) {
+        const url = parseUrl(event.data.params.url);
+        const panelOrigin = url?.origin;
+        const handler = (ev: MessageEvent) => {
+          if (ev.source === iframe.contentWindow) return;
+          if (!panelOrigin || panelOrigin === "null") return;
+          if (panelOrigin !== ev.origin) return;
+          iframe.postMessage(ev.data);
+        };
+        window.addEventListener("message", handler);
         this.activePanels[panelId] = panel;
         const interval = setInterval(() => {
           if (!panel?.closed) return;
-
           window.removeEventListener("message", handler);
           const args = { method: "proxy-window:closed", windowId: panelId };
           delete this.activePanels[panelId];
           clearInterval(interval);
-
           try {
             iframe.postMessage(args);
           } catch {}

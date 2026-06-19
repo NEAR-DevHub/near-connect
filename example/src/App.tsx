@@ -11,6 +11,27 @@ import { parseNearAmount } from "@near-js/utils";
 
 const RPC_URL = "https://relmn.aurora.dev";
 
+// SignClient.init MUST run exactly once per page load. React StrictMode
+// double-invokes the `useState(() => ...)` initializer in dev, which would
+// otherwise create two SignClient instances. They share underlying storage
+// but track pending sessions/proposals separately, causing
+// "Pending session not found for topic" errors when wallet responses
+// land on the discarded instance.
+let _walletConnectClient: ReturnType<typeof SignClient.init> | null = null;
+function getWalletConnectClient() {
+  if (_walletConnectClient) return _walletConnectClient;
+  _walletConnectClient = SignClient.init({
+    projectId: "16ebac7c9fbe9e612bb78ea9f012ce80",
+    metadata: {
+      name: "Example App",
+      description: "Example App",
+      url: "https://example.com",
+      icons: ["/favicon.ico"],
+    },
+  });
+  return _walletConnectClient;
+}
+
 const ProveOwnershipDemo: FC<{
   connector: NearConnector;
   onAuthenticated: (wallet: NearWalletBase, accountId: string) => void;
@@ -102,15 +123,7 @@ export const ExampleNEAR: FC = () => {
   }
 
   const [connector] = useState<NearConnector>(() => {
-    const walletConnect = SignClient.init({
-      projectId: "16ebac7c9fbe9e612bb78ea9f012ce80",
-      metadata: {
-        name: "Example App",
-        description: "Example App",
-        url: "https://example.com",
-        icons: ["/favicon.ico"],
-      },
-    });
+    const walletConnect = getWalletConnectClient();
 
     const connector = new NearConnector({
       manifest: process.env.NODE_ENV === "production" ? undefined : "/near-connect/repository/manifest.json",

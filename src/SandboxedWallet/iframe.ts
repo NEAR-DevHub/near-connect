@@ -77,6 +77,10 @@ class IframeExecutor {
     this.iframe.contentWindow.postMessage({ ...data, origin: this.origin }, "*");
   }
 
+  get contentWindow(): Window | null {
+    return this.iframe.contentWindow;
+  }
+
   dispose() {
     window.removeEventListener("message", this.handler);
     this.popup.destroy();

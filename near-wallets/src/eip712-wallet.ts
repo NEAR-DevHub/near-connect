@@ -334,6 +334,15 @@ async function wcConnect(): Promise<{ address: string }> {
     });
   }
 
+  // Drop any persisted WC session BEFORE pairing. WC v2 stores sessions
+  // in localStorage across reloads, and a stale session would cause
+  // `getSession()` to return its dead topic immediately — the poll would
+  // resolve before the new pairing completed and any sign request sent
+  // via that topic would never reach the wallet (or return undefined).
+  try { await wcDisconnect(); } catch {}
+  const staleSessionBeforeConnect = await window.selector.walletConnect.getSession();
+  const staleTopic = staleSessionBeforeConnect?.topic ?? null;
+
   const result = await window.selector.walletConnect.connect({
     requiredNamespaces: {
       eip155: {
@@ -347,27 +356,42 @@ async function wcConnect(): Promise<{ address: string }> {
   await new Promise((r) => setTimeout(r, 100));
   await modal.openModal({ uri: result.uri, standaloneChains: ["eip155:1"] });
 
-  return new Promise(async (resolve, reject) => {
-    modal.subscribeModal(({ open }) => {
-      if (!open) reject(new Error("User cancelled pairing"));
-    });
-
-    while (true) {
-      const session = await window.selector.walletConnect.getSession();
-      if (session) {
-        const accounts: string[] = session.namespaces?.eip155?.accounts ?? [];
-        const address = accounts[0]?.split(":").pop() ?? "";
-        if (!address) { reject(new Error("No Ethereum account")); return; }
-        spinner.remove();
-        modal.closeModal();
-        // Don't hide the iframe — show pending UI for the upcoming signing request
-        showPendingUI("Confirm in your wallet");
-        resolve({ address });
-        return;
-      }
-      await new Promise((r) => setTimeout(r, 1000));
-    }
+  // Mobile wallets and Ledger Live close the WC modal as soon as the user
+  // is deeplinked, well before the session is observable via getSession().
+  // Polling indefinitely is fine; the "Use a different wallet" button
+  // (which fires `_pendingCancel`) is the escape hatch.
+  const cancellable = new Promise<never>((_, reject) => {
+    _pendingCancel = (e) => reject(e);
   });
+  const poll = new Promise<{ address: string }>(async (resolve, reject) => {
+    try {
+      while (true) {
+        const session = await window.selector.walletConnect.getSession();
+        if (session && session.topic !== staleTopic) {
+          const accounts: string[] = session.namespaces?.eip155?.accounts ?? [];
+          const address = accounts[0]?.split(":").pop() ?? "";
+          if (!address) { reject(new Error("No Ethereum account")); return; }
+          resolve({ address });
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    } catch (e) { reject(e as Error); }
+  });
+  try {
+    const out = await Promise.race([poll, cancellable]);
+    spinner.remove();
+    modal.closeModal();
+    // Don't hide the iframe — show pending UI for the upcoming signing request
+    showPendingUI("Confirm in your wallet");
+    return out;
+  } catch (e) {
+    spinner.remove();
+    modal.closeModal();
+    throw e;
+  } finally {
+    _pendingCancel = null;
+  }
 }
 
 // Set while a wcRequest is in flight so the "Use different wallet" button on
@@ -1066,6 +1090,9 @@ const Eip712Wallet = async () => {
         sigHex = await wcRequest("eth_signTypedData_v4", [address, JSON.stringify(typedData)]);
       } finally {
         hidePendingUI();
+      }
+      if (typeof sigHex !== "string" || sigHex.length === 0) {
+        throw new Error("Wallet returned no signature for the authorization request.");
       }
 
       // If not signed in yet, recover the public key from this signature
