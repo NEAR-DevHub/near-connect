@@ -191,6 +191,14 @@ function pubKeyToEthAddress(pubKey: Uint8Array): string {
   return "0x" + hex.encode(hash.slice(12));
 }
 
+/** Decode an Ethereum hex signature to raw bytes, normalising the recovery
+ *  byte from Ethereum's 27/28 to the contract's 0/1. */
+function decodeEthSignature(sigHex: string): Uint8Array {
+  const bytes = hex.decode(sigHex.replace(/^0x/, ""));
+  if (bytes[64] >= 27) bytes[64] -= 27;
+  return bytes;
+}
+
 // ─── Wallet-Contract State / Account Derivation ──────────────────────────────
 
 function buildWalletState(publicKey64: Uint8Array): Uint8Array {
@@ -282,9 +290,7 @@ function buildEip712TypedData(msg: WalletRequestMessage) {
 /** Build the proof JSON for w_execute_signed from an EIP-712 signature.
  *  The proof mirrors the EIP-712 message fields plus the signature. */
 function buildProof(msg: WalletRequestMessage, ethSignatureHex: string): string {
-  const sigBytes = hex.decode(ethSignatureHex.replace(/^0x/, ""));
-  // Normalise v: Ethereum uses 27/28, contract expects 0/1
-  if (sigBytes[64] >= 27) sigBytes[64] -= 27;
+  const sigBytes = decodeEthSignature(ethSignatureHex);
   const sigEncoded = `secp256k1:${base58.encode(sigBytes)}`;
   return JSON.stringify({
     chainId: msg.chain_id,
@@ -309,92 +315,95 @@ async function wcConnect(): Promise<{ address: string }> {
   // post-revoke retry will flow through the WalletConnect branch instead.
   if (await ethereumBridgeAvailable()) {
     showPendingUI("Confirm in your wallet");
-    const accounts: string[] = await wcRequest("eth_requestAccounts", []);
-    const address = accounts?.[0];
-    if (!address) throw new Error("No Ethereum account");
-    return { address };
+    try {
+      const accounts: string[] = await wcRequest("eth_requestAccounts", []);
+      const address = accounts?.[0];
+      if (!address) throw new Error("No Ethereum account");
+      // Keep the pending UI up for the signing step that follows.
+      return { address };
+    } catch (e) {
+      hidePendingUI();
+      throw e;
+    }
   }
 
-  window.selector.ui.showIframe();
-
-  // Loading spinner
-  const spinner = document.createElement("div");
-  spinner.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="80" height="80" style="display:block">
-    <circle stroke-dasharray="75 27" r="16" stroke-width="4" stroke="#fff" fill="none" cy="50" cx="50">
-      <animateTransform keyTimes="0;1" values="0 50 50;360 50 50" dur="1.4s" repeatCount="indefinite" type="rotate" attributeName="transform"/>
-    </circle></svg>`;
-  spinner.style.cssText = "position:absolute;top:50%;left:50%;transform:translate(-50%,-50%)";
-  document.body.appendChild(spinner);
-
-  if (!modal) {
-    modal = new WalletConnectModal({
-      chains: ["eip155:1"],
-      projectId: await window.selector.walletConnect.getProjectId(),
-      themeMode: "dark",
-    });
-  }
-
-  // Drop any persisted WC session BEFORE pairing. WC v2 stores sessions
-  // in localStorage across reloads, and a stale session would cause
-  // `getSession()` to return its dead topic immediately — the poll would
-  // resolve before the new pairing completed and any sign request sent
-  // via that topic would never reach the wallet (or return undefined).
-  try { await wcDisconnect(); } catch {}
-  const staleSessionBeforeConnect = await window.selector.walletConnect.getSession();
-  const staleTopic = staleSessionBeforeConnect?.topic ?? null;
-
-  const result = await window.selector.walletConnect.connect({
-    requiredNamespaces: {
-      eip155: {
-        chains: ["eip155:1"],
-        methods: WC_METHODS,
-        events: WC_EVENTS,
-      },
-    },
-  });
-
-  await new Promise((r) => setTimeout(r, 100));
-  await modal.openModal({ uri: result.uri, standaloneChains: ["eip155:1"] });
-
-  // Mobile wallets and Ledger Live close the WC modal as soon as the user
-  // is deeplinked, well before the session is observable via getSession().
-  // Polling indefinitely is fine; the "Use a different wallet" button
-  // (which fires `_pendingCancel`) is the escape hatch.
+  // Non-bridge path: pair via the WalletConnect modal. Set the cancel hook
+  // first and render the pending UI (spinner + "Use a different wallet"
+  // button) as the base layer so the user always has an escape hatch — the
+  // WC modal opens on top and may auto-close on mobile/Ledger deeplink,
+  // leaving this layer (and its cancel button) visible while we poll. Any
+  // failure in setup or polling tears the whole UI down via the catch.
   const cancellable = new Promise<never>((_, reject) => {
     _pendingCancel = (e) => reject(e);
   });
-  const poll = new Promise<{ address: string }>(async (resolve, reject) => {
-    try {
-      while (true) {
-        const session = await window.selector.walletConnect.getSession();
-        if (session && session.topic !== staleTopic) {
-          const accounts: string[] = session.namespaces?.eip155?.accounts ?? [];
-          const address = accounts[0]?.split(":").pop() ?? "";
-          if (!address) { reject(new Error("No Ethereum account")); return; }
-          resolve({ address });
-          return;
-        }
-        // User rejected pairing in their wallet app — WC's `approval()`
-        // promise rejected on the parent. Surface as a standard cancel.
-        const approvalErr = await (window.selector.walletConnect as any).getApprovalError?.();
-        if (approvalErr) {
-          reject(new Error("User rejected"));
-          return;
-        }
-        await new Promise((r) => setTimeout(r, 500));
-      }
-    } catch (e) { reject(e as Error); }
-  });
   try {
+    showPendingUI("Connecting your wallet…");
+
+    if (!modal) {
+      modal = new WalletConnectModal({
+        chains: ["eip155:1"],
+        projectId: await window.selector.walletConnect.getProjectId(),
+        themeMode: "dark",
+      });
+    }
+
+    // Drop any persisted WC session BEFORE pairing. WC v2 stores sessions
+    // in localStorage across reloads, and a stale session would cause
+    // `getSession()` to return its dead topic immediately — the poll would
+    // resolve before the new pairing completed and any sign request sent
+    // via that topic would never reach the wallet (or return undefined).
+    try { await wcDisconnect(); } catch {}
+    const staleSessionBeforeConnect = await window.selector.walletConnect.getSession();
+    const staleTopic = staleSessionBeforeConnect?.topic ?? null;
+
+    const result = await window.selector.walletConnect.connect({
+      requiredNamespaces: {
+        eip155: {
+          chains: ["eip155:1"],
+          methods: WC_METHODS,
+          events: WC_EVENTS,
+        },
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 100));
+    await modal.openModal({ uri: result.uri, standaloneChains: ["eip155:1"] });
+
+    // Mobile wallets and Ledger Live close the WC modal as soon as the user
+    // is deeplinked, well before the session is observable via getSession().
+    // Polling indefinitely is fine; the "Use a different wallet" button on
+    // the base layer (which fires `_pendingCancel`) is the escape hatch.
+    const poll = new Promise<{ address: string }>(async (resolve, reject) => {
+      try {
+        while (true) {
+          const session = await window.selector.walletConnect.getSession();
+          if (session && session.topic !== staleTopic) {
+            const accounts: string[] = session.namespaces?.eip155?.accounts ?? [];
+            const address = accounts[0]?.split(":").pop() ?? "";
+            if (!address) { reject(new Error("No Ethereum account")); return; }
+            resolve({ address });
+            return;
+          }
+          // User rejected pairing in their wallet app — WC's `approval()`
+          // promise rejected on the parent. Surface as a standard cancel.
+          const approvalErr = await (window.selector.walletConnect as any).getApprovalError?.();
+          if (approvalErr) {
+            reject(new Error("User rejected"));
+            return;
+          }
+          await new Promise((r) => setTimeout(r, 500));
+        }
+      } catch (e) { reject(e as Error); }
+    });
+
     const out = await Promise.race([poll, cancellable]);
-    spinner.remove();
     modal.closeModal();
-    // Don't hide the iframe — show pending UI for the upcoming signing request
+    // Don't hide the iframe — keep the pending UI up for the signing request.
     showPendingUI("Confirm in your wallet");
     return out;
   } catch (e) {
-    spinner.remove();
-    modal.closeModal();
+    try { modal?.closeModal(); } catch {}
+    hidePendingUI();
     throw e;
   } finally {
     _pendingCancel = null;
@@ -556,6 +565,22 @@ async function wcDisconnect() {
       topic: session.topic,
       reason: { code: 5900, message: "User disconnected" },
     });
+  }
+}
+
+/** Show the pending UI, request a signature over the WalletConnect/bridge
+ *  transport, then always tear the UI down. Throws a clear error when the
+ *  wallet returns an empty / non-string signature (e.g. a silent reject). */
+async function promptSignature(method: string, params: any[], message: string): Promise<string> {
+  showPendingUI(message);
+  try {
+    const sig = await wcRequest(method, params);
+    if (typeof sig !== "string" || sig.length === 0) {
+      throw new Error("Wallet returned no signature.");
+    }
+    return sig;
+  } finally {
+    hidePendingUI();
   }
 }
 
@@ -723,13 +748,12 @@ function buildRequestMessage(accountId: string, request: WalletRequest, network:
 
 async function signWithEip712(ethAddress: string, msg: WalletRequestMessage): Promise<string> {
   const typedData = buildEip712TypedData(msg);
-  showPendingUI("Confirm transaction in your wallet");
-  try {
-    const sigHex: string = await wcRequest("eth_signTypedData_v4", [ethAddress, JSON.stringify(typedData)]);
-    return buildProof(msg, sigHex);
-  } finally {
-    hidePendingUI();
-  }
+  const sigHex = await promptSignature(
+    "eth_signTypedData_v4",
+    [ethAddress, JSON.stringify(typedData)],
+    "Confirm transaction in your wallet",
+  );
+  return buildProof(msg, sigHex);
 }
 
 async function signAndRelay(
@@ -758,17 +782,14 @@ async function signMessageViaEthereum(
 
   // Sign via personal_sign (ERC-191)
   const hexMessage = "0x" + hex.encode(new TextEncoder().encode(personalMessage));
-  showPendingUI("Confirm message in your wallet");
-  let sigHex: string;
-  try {
-    sigHex = await wcRequest("personal_sign", [hexMessage, ethAddress]);
-  } finally {
-    hidePendingUI();
-  }
+  const sigHex = await promptSignature(
+    "personal_sign",
+    [hexMessage, ethAddress],
+    "Confirm message in your wallet",
+  );
 
   // Return with secp256k1 public key so verifiers know the signing standard
-  const sigBytes = hex.decode(sigHex.replace(/^0x/, ""));
-  if (sigBytes[64] >= 27) sigBytes[64] -= 27;
+  const sigBytes = decodeEthSignature(sigHex);
 
   return {
     accountId: walletAccountId,
@@ -798,14 +819,15 @@ const Eip712Wallet = async () => {
 
   function isSignedIn() { return !!(ethAddress && publicKey64 && accountId); }
 
-  _clearWalletState = () => {
+  function clearState() {
     ethAddress = null;
     publicKey64 = null;
     accountId = null;
     try { window.localStorage.removeItem(STORAGE_KEY_ETH_ADDRESS); } catch {}
     try { window.localStorage.removeItem(STORAGE_KEY_PUBLIC_KEY); } catch {}
     try { window.localStorage.removeItem(STORAGE_KEY_ACCOUNT_ID); } catch {}
-  };
+  }
+  _clearWalletState = clearState;
 
   function saveState(addr: string, pk: Uint8Array, acct: string) {
     ethAddress = addr;
@@ -901,9 +923,9 @@ const Eip712Wallet = async () => {
     return address;
   }
 
-  /** Recover pubkey from a signature and save state. Returns the full state. */
-  function recoverAndSave(address: string, typedData: any, sigHex: string) {
-    const pk = recoverPublicKeyFromEip712Sig(typedData, sigHex);
+  /** Verify a recovered public key matches the connected address, derive the
+   *  wallet-contract account, and persist the full state. */
+  function finalizeKey(address: string, pk: Uint8Array) {
     const derivedAddr = pubKeyToEthAddress(pk);
     if (derivedAddr.toLowerCase() !== address.toLowerCase()) {
       throw new Error(`Recovered address ${derivedAddr} does not match ${address}`);
@@ -911,6 +933,24 @@ const Eip712Wallet = async () => {
     const acct = deriveAccountId(pk);
     saveState(address, pk, acct);
     return { ethAddress: address, publicKey64: pk, accountId: acct };
+  }
+
+  /** Recover pubkey from an EIP-712 signature and persist the state. */
+  function recoverAndSave(address: string, typedData: any, sigHex: string) {
+    return finalizeKey(address, recoverPublicKeyFromEip712Sig(typedData, sigHex));
+  }
+
+  /** Initialise the wallet-contract account on-chain for a freshly recovered
+   *  key. On failure, clear the half-written sign-in state so the user is
+   *  never left "signed in" with no usable on-chain account (every later tx
+   *  relays with includeStateInit=false and would otherwise fail forever). */
+  async function establishOnChain(acct: string, pk: Uint8Array) {
+    try {
+      await ensureStateInitOnChain(acct, pk);
+    } catch (e) {
+      clearState();
+      throw e;
+    }
   }
 
   async function connectAndRecover(): Promise<{ ethAddress: string; publicKey64: Uint8Array; accountId: string }> {
@@ -922,34 +962,19 @@ const Eip712Wallet = async () => {
     // 2. Ask user to sign a message so we can recover the full public key
     const recoveryMessage = "Sign this message to connect your Ethereum wallet to NEAR.\n\nThis signature will NOT trigger any blockchain transaction.";
     const hexMsg = "0x" + hex.encode(new TextEncoder().encode(recoveryMessage));
-    showPendingUI("Confirm in your wallet");
-    let sigHex: string;
-    try {
-      sigHex = await wcRequest("personal_sign", [hexMsg, address]);
-    } finally {
-      hidePendingUI();
-    }
+    const sigHex = await promptSignature("personal_sign", [hexMsg, address], "Confirm in your wallet");
 
-    // 3. Recover secp256k1 public key
+    // 3. Recover the secp256k1 public key, verify it against the address,
+    //    derive the wallet-contract account, and persist the state.
     const pk = recoverPublicKeyFromPersonalSign(recoveryMessage, sigHex);
-
-    // 4. Verify it matches the Ethereum address
-    const derivedAddr = pubKeyToEthAddress(pk);
-    if (derivedAddr.toLowerCase() !== address.toLowerCase()) {
-      throw new Error(`Recovered address ${derivedAddr} does not match ${address}`);
-    }
-
-    // 5. Derive wallet-contract account
-    const acct = deriveAccountId(pk);
-    saveState(address, pk, acct);
-    return { ethAddress: address, publicKey64: pk, accountId: acct };
+    return finalizeKey(address, pk);
   }
 
   return {
     async signIn({ network }: SignInParams) {
       const { accountId: acct, publicKey64: pk } = await connectAndRecover();
 
-      await ensureStateInitOnChain(acct, pk);
+      await establishOnChain(acct, pk);
 
       return [{ accountId: acct, publicKey: `secp256k1:${base58.encode(pk)}` }];
     },
@@ -958,7 +983,7 @@ const Eip712Wallet = async () => {
       const { network, messageParams } = data;
       const { accountId: acct, publicKey64: pk, ethAddress: addr } = await connectAndRecover();
 
-      await ensureStateInitOnChain(acct, pk);
+      await establishOnChain(acct, pk);
 
       const signedMessage = await signMessageViaEthereum(
         addr, acct, pk,
@@ -969,11 +994,8 @@ const Eip712Wallet = async () => {
     },
 
     async signOut() {
-      await wcDisconnect();
-      ethAddress = null; publicKey64 = null; accountId = null;
-      window.localStorage.removeItem(STORAGE_KEY_ETH_ADDRESS);
-      window.localStorage.removeItem(STORAGE_KEY_PUBLIC_KEY);
-      window.localStorage.removeItem(STORAGE_KEY_ACCOUNT_ID);
+      try { await wcDisconnect(); } catch {}
+      clearState();
     },
 
     async getAccounts() {
@@ -1090,30 +1112,32 @@ const Eip712Wallet = async () => {
         message: { purpose, recipient, payload },
       };
 
-      // Single signature — show pending UI while user confirms in their wallet
-      showPendingUI("Confirm in your wallet");
-      let sigHex: string;
-      try {
-        sigHex = await wcRequest("eth_signTypedData_v4", [address, JSON.stringify(typedData)]);
-      } finally {
-        hidePendingUI();
-      }
-      if (typeof sigHex !== "string" || sigHex.length === 0) {
-        throw new Error("Wallet returned no signature for the authorization request.");
-      }
+      // Single signature — pending UI shown + torn down by promptSignature.
+      const wasSignedIn = isSignedIn();
+      const sigHex = await promptSignature(
+        "eth_signTypedData_v4",
+        [address, JSON.stringify(typedData)],
+        "Confirm in your wallet",
+      );
 
       // If not signed in yet, recover the public key from this signature
-      if (!isSignedIn()) {
+      if (!wasSignedIn) {
         recoverAndSave(address, typedData, sigHex);
       }
 
       // Ensure the wallet-contract account is initialised on-chain so the
-      // dApp's subsequent `w_resolve_auth` view call can succeed.
-      await ensureStateInitOnChain(accountId!, publicKey64!);
+      // dApp's subsequent `w_resolve_auth` view call can succeed. Roll back
+      // only freshly-established state — an already-signed-in user keeps
+      // their session through a transient relayer hiccup.
+      try {
+        await ensureStateInitOnChain(accountId!, publicKey64!);
+      } catch (e) {
+        if (!wasSignedIn) clearState();
+        throw e;
+      }
 
       // Build the authorization as a plain JSON string
-      const sigBytes = hex.decode(sigHex.replace(/^0x/, ""));
-      if (sigBytes[64] >= 27) sigBytes[64] -= 27;
+      const sigBytes = decodeEthSignature(sigHex);
       const sigEncoded = `secp256k1:${base58.encode(sigBytes)}`;
 
       return {
