@@ -374,6 +374,13 @@ async function wcConnect(): Promise<{ address: string }> {
           resolve({ address });
           return;
         }
+        // User rejected pairing in their wallet app — WC's `approval()`
+        // promise rejected on the parent. Surface as a standard cancel.
+        const approvalErr = await (window.selector.walletConnect as any).getApprovalError?.();
+        if (approvalErr) {
+          reject(new Error("User rejected"));
+          return;
+        }
         await new Promise((r) => setTimeout(r, 500));
       }
     } catch (e) { reject(e as Error); }
