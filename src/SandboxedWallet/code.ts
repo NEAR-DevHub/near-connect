@@ -218,6 +218,9 @@ async function getIframeCode(args: { id: string; executor: SandboxExecutor; code
           getSession() {
             return window.selector.call("walletConnect.getSession", {});
           },
+          getApprovalError() {
+            return window.selector.call("walletConnect.getApprovalError", {});
+          },
         },
 
         ethereum: {

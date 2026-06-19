@@ -215,6 +215,9 @@ async function getIframeCode(args) {
           getSession() {
             return window.selector.call("walletConnect.getSession", {});
           },
+          getApprovalError() {
+            return window.selector.call("walletConnect.getApprovalError", {});
+          },
         },
 
         ethereum: {

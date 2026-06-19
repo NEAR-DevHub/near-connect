@@ -28,6 +28,11 @@ let _eip6963ProviderIndex = 0;
 // extension revoked permission). The bridge then reports unavailable and
 // the iframe falls back to its WalletConnect path.
 let _ethereumBridgeDisabled = false;
+// Set when the WalletConnect sign-client's `connect().approval()` rejects
+// (typically because the user rejected the pairing in their wallet app).
+// Reset on every new `walletConnect.connect` call. Lets the iframe surface
+// the rejection without holding the approval promise itself.
+let _lastWcApprovalError = null;
 function installEip6963Listener() {
     if (typeof window === "undefined" || _eip6963ListenerInstalled)
         return;
@@ -208,13 +213,22 @@ class SandboxExecutor {
                 if (!this.connector.walletConnect)
                     throw new Error("WalletConnect is not configured");
                 const client = await this.connector.walletConnect;
+                _lastWcApprovalError = null;
                 const result = await client.connect(event.data.params);
-                result.approval();
+                result.approval().catch((err) => {
+                    _lastWcApprovalError = err;
+                });
                 success({ uri: result.uri });
             }
             catch (e) {
                 failed(e);
             }
+            return;
+        }
+        if (event.data.method === "walletConnect.getApprovalError") {
+            this.assertPermissions(iframe, "walletConnect", event);
+            const err = _lastWcApprovalError;
+            success(err ? { message: err?.message ?? String(err), code: err?.code } : null);
             return;
         }
         if (event.data.method === "walletConnect.getProjectId") {
