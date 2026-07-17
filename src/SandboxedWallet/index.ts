@@ -55,8 +55,13 @@ export class SandboxWallet {
 
   async signOut(data?: { network?: Network }): Promise<void> {
     const args = { ...data, network: data?.network ?? this.connector.network };
+    // The wallet's own `wallet:signOut` handler owns its storage lifecycle: it
+    // clears session/sensitive keys and may deliberately KEEP non-sensitive
+    // caches (e.g. a passkey wallet keeps its rawId -> publicKey map to skip
+    // RPC lookups and recognise returning/additional accounts on this device).
+    // The host must NOT blanket-wipe the wallet's storage space here — that
+    // destroyed those caches regardless of the wallet's intent.
     await this.executor.call("wallet:signOut", args);
-    await this.executor.clearStorage();
   }
 
   async getAccounts(data?: { network?: Network }): Promise<Array<Account>> {
