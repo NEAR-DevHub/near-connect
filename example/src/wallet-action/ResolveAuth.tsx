@@ -2,13 +2,14 @@ import { useState } from "react";
 import { IPropsWalletAction } from "./wallet-action.types.ts";
 
 export const ResolveAuth = ({ wallet, network }: IPropsWalletAction) => {
-  const [payload, setPayload] = useState("Approve withdrawal of 100 USDC to bob.near");
-  const [recipient, setRecipient] = useState("example.app");
+  const [domain, setDomain] = useState("example.app");
+  const [action, setAction] = useState("Approve");
+  const [msg, setMsg] = useState("Approve withdrawal of 100 USDC to bob.near");
   const [result, setResult] = useState<string>("");
   const [error, setError] = useState<string>("");
   const [loading, setLoading] = useState(false);
 
-  const handleResolveAuth = async (purpose: "PROVE_OWNERSHIP" | "APPROVE_OFFCHAIN_ACTION") => {
+  const handleResolveAuth = async () => {
     if (!wallet.resolveAuth) {
       setError("This wallet does not support resolveAuth (NEP-641)");
       return;
@@ -17,12 +18,10 @@ export const ResolveAuth = ({ wallet, network }: IPropsWalletAction) => {
     setError("");
     setLoading(true);
     try {
-      const res = await wallet.resolveAuth({
-        purpose,
-        recipient,
-        payload,
-        network,
-      });
+      // NEP-641 recommends the domain-separated JSON payload so wallets render
+      // it consistently and the dApp can rule out cross-dApp/cross-action replay.
+      const payload = JSON.stringify({ domain, action, msg }, null, 2);
+      const res = await wallet.resolveAuth({ payload, network });
       setResult(JSON.stringify(res, null, 2));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -36,30 +35,20 @@ export const ResolveAuth = ({ wallet, network }: IPropsWalletAction) => {
       <p className={"input-form-label"}>NEP-641 Auth Resolve</p>
       <div className={"flex flex-col gap-3"}>
         <div className={"input-group"}>
-          <p className={"input-label"}>Recipient (dApp domain)</p>
-          <input
-            className={"input-text"}
-            type="text"
-            value={recipient}
-            onChange={(e) => setRecipient(e.target.value)}
-          />
+          <p className={"input-label"}>Domain (dApp)</p>
+          <input className={"input-text"} type="text" value={domain} onChange={(e) => setDomain(e.target.value)} />
         </div>
         <div className={"input-group"}>
-          <p className={"input-label"}>Payload</p>
-          <input
-            className={"input-text"}
-            type="text"
-            value={payload}
-            onChange={(e) => setPayload(e.target.value)}
-          />
+          <p className={"input-label"}>Action</p>
+          <input className={"input-text"} type="text" value={action} onChange={(e) => setAction(e.target.value)} />
+        </div>
+        <div className={"input-group"}>
+          <p className={"input-label"}>Message</p>
+          <input className={"input-text"} type="text" value={msg} onChange={(e) => setMsg(e.target.value)} />
         </div>
         <div className={"flex gap-2"}>
-          <button
-            className={"input-button compact flex-1"}
-            disabled={loading}
-            onClick={() => handleResolveAuth("APPROVE_OFFCHAIN_ACTION")}
-          >
-            {loading ? "Signing..." : "Approve Action"}
+          <button className={"input-button compact flex-1"} disabled={loading} onClick={handleResolveAuth}>
+            {loading ? "Signing..." : "Authorize"}
           </button>
         </div>
         {result && (

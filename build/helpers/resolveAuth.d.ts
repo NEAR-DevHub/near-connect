@@ -1,24 +1,24 @@
 import type { AccountWithSignedMessage, NearWalletBase, ResolveAuthParams, ResolveAuthResponse, SignInAndSignMessageParams } from "../types";
 /**
- * NEP-641 default `resolveAuth` implementation, built on top of NEP-413
- * `signMessage`. Per NEP-641 §"NEP-413 fallback", the `purpose` is bound
- * into the signed material by prefixing the `recipient` field with
- * `"<PURPOSE>@"`. The dApp backend reconstructs the same prefix when it
- * cannot find `w_resolve_auth` on the account and falls back to NEP-413
- * verification.
+ * NEP-641 default `resolveAuth` for wallets controlled by full-access keys,
+ * built on top of NEP-413 `signMessage`.
  *
- * If the user is not yet signed in to the wallet, the helper uses
- * `signInAndSignMessage` to combine sign-in and authorization into a single
- * user gesture; otherwise it uses the standalone `signMessage` against the
- * already-connected account.
+ * Per NEP-641 §"Access-key authorization", the signed material is the
+ * `OffchainMessage` envelope `{ chain_id, signer_id, path: [], timestamp,
+ * payload }`, mapped onto NEP-413 as: `message` = payload, `nonce` = the
+ * envelope's canonical hash (binds every field), `recipient` =
+ * `"<chain_id>: <signer_id> @ <timestamp>"` (what NEP-413 wallets render).
  *
- * The returned `authorization` is a JSON-stringified NEP-413 `SignedMessage`
- * extended with the original `purpose`, `recipient`, and `payload` so the
- * dApp can fully reconstruct the verification input without out-of-band
- * context. The bound `recipient` used inside the NEP-413 signature is
- * `"<PURPOSE>@<recipient>"`.
+ * The envelope names the signer, so the account must be known *before*
+ * signing: a wallet that isn't signed in yet is signed in first (without
+ * adding a key), then asked to sign — two user gestures. Wallets that want a
+ * single gesture implement `resolveAuth` natively.
+ *
+ * The returned `authorization` is a JSON-stringified `AccessKeyAuthorization`
+ * the dApp verifies offchain against the account's full-access keys at a
+ * pinned block (see `verifyResolveAuth`). No contract is involved.
  */
-export declare function defaultResolveAuthViaSignMessage(wallet: Pick<NearWalletBase, "signMessage" | "signInAndSignMessage" | "getAccounts">, params: ResolveAuthParams): Promise<ResolveAuthResponse>;
+export declare function defaultResolveAuthViaSignMessage(wallet: Pick<NearWalletBase, "signIn" | "signMessage" | "getAccounts">, params: ResolveAuthParams): Promise<ResolveAuthResponse>;
 /**
  * Polyfill `signInAndSignMessage` for wallets that don't support the combined
  * flow natively but expose `signIn` (without addKey) + `signMessage`. The
