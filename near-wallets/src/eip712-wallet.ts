@@ -1084,66 +1084,89 @@ const Eip712Wallet = async () => {
       return { signedDelegateActions: [base64.encode(sdW.toBytes())] };
     },
 
-    async resolveAuth({ purpose, recipient, payload }: {
-      purpose: string; recipient: string; payload: string; network?: string;
+    /**
+     * NEP-641 `resolveAuth`: authorize `payload` with an EIP-712 signature over
+     * the standard `OffchainMessage` envelope.
+     *
+     * The envelope names the signer (`signer_id`), so the wallet-contract
+     * account must be known before signing: a fresh user first connects and
+     * recovers their key (`connectAndRecover`, one signature), then signs the
+     * envelope (second signature). An already-signed-in user signs once.
+     *
+     * Blob format (mirrors the near/intents reference wallet's
+     * `WalletAuthorization::Signature { msg, proof }`; the contract at
+     * `WALLET_CONTRACT_ACCOUNT_ID` must verify the EIP-712 signature over
+     * exactly this typed data and enforce the NEP-641 envelope checks —
+     * chain_id, signer_id, path == argument path, timestamp not in the future):
+     *
+     * ```json
+     * { "signature": { "msg": { ...OffchainMessage }, "proof": "secp256k1:<base58 r||s||v>" } }
+     * ```
+     */
+    async resolveAuth({ payload, network, chainId }: {
+      payload: string; network?: Network; chainId?: string;
     }) {
-      // Ensure WalletConnect is connected (pairing only, no signature)
-      const address = await ensureConnected();
+      const { accountId: acct, publicKey64: pk, ethAddress: addr } = await connectAndRecover();
 
-      // accountId is NOT part of the signed data — the contract verifies
-      // the recovered public key matches its configured key.
+      // Ensure the wallet-contract account is initialised on-chain so the
+      // dApp's subsequent `w_resolve_auth` view call can succeed.
+      await establishOnChain(acct, pk);
+
+      // NEP-641 OffchainMessage (top-level: empty path), timestamped ~60s in
+      // the past to absorb clock skew and block-time lag.
+      const msg = {
+        chain_id: chainId ?? (network === "testnet" ? "testnet" : "mainnet"),
+        signer_id: acct,
+        path: [] as string[],
+        timestamp: new Date(Math.floor(Date.now() / 1000 - 60) * 1000).toISOString().replace(/\.\d{3}Z$/, "Z"),
+        payload,
+      };
+
       const typedData = {
         types: {
           EIP712Domain: [
             { name: "name", type: "string" },
             { name: "version", type: "string" },
           ],
-          Authorization: [
-            { name: "purpose", type: "string" },
-            { name: "recipient", type: "string" },
+          OffchainMessage: [
+            { name: "chainId", type: "string" },
+            { name: "signerId", type: "string" },
+            { name: "path", type: "string[]" },
+            { name: "timestamp", type: "string" },
             { name: "payload", type: "string" },
           ],
         },
-        primaryType: "Authorization" as const,
+        primaryType: "OffchainMessage" as const,
         domain: {
           name: EIP712_DOMAIN_NAME,
           version: EIP712_DOMAIN_VERSION,
         },
-        message: { purpose, recipient, payload },
+        message: {
+          chainId: msg.chain_id,
+          signerId: msg.signer_id,
+          path: msg.path,
+          timestamp: msg.timestamp,
+          payload: msg.payload,
+        },
       };
 
       // Single signature — pending UI shown + torn down by promptSignature.
-      const wasSignedIn = isSignedIn();
       const sigHex = await promptSignature(
         "eth_signTypedData_v4",
-        [address, JSON.stringify(typedData)],
+        [addr, JSON.stringify(typedData)],
         "Confirm in your wallet",
       );
 
-      // If not signed in yet, recover the public key from this signature
-      if (!wasSignedIn) {
-        recoverAndSave(address, typedData, sigHex);
-      }
-
-      // Ensure the wallet-contract account is initialised on-chain so the
-      // dApp's subsequent `w_resolve_auth` view call can succeed. Roll back
-      // only freshly-established state — an already-signed-in user keeps
-      // their session through a transient relayer hiccup.
-      try {
-        await ensureStateInitOnChain(accountId!, publicKey64!);
-      } catch (e) {
-        if (!wasSignedIn) clearState();
-        throw e;
-      }
-
-      // Build the authorization as a plain JSON string
       const sigBytes = decodeEthSignature(sigHex);
-      const sigEncoded = `secp256k1:${base58.encode(sigBytes)}`;
+      const proof = `secp256k1:${base58.encode(sigBytes)}`;
 
       return {
-        accountId: accountId!,
+        accountId: acct,
         authorization: JSON.stringify({
-          purpose, recipient, payload, signature: sigEncoded,
+          signature: {
+            msg: { chain_id: msg.chain_id, signer_id: msg.signer_id, timestamp: msg.timestamp, payload: msg.payload },
+            proof,
+          },
         }),
       };
     },

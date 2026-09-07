@@ -56,23 +56,28 @@ const ProveOwnershipDemo: FC<{
         return;
       }
 
-      // 2. Generate challenge and request authorization (single signature)
+      // 2. Issue a challenge (NEP-641 recommends the domain-separated JSON
+      //    payload) and request the authorization.
       setStatus("Sign authorization...");
-      const challenge = `Login to Example App at ${new Date().toISOString()}`;
-      const res = await wallet.resolveAuth({
-        purpose: "PROVE_OWNERSHIP",
-        recipient: "example.app",
-        payload: challenge,
-      });
+      const challenge = JSON.stringify(
+        {
+          domain: "example.app",
+          action: "Login",
+          msg: `Login to Example App at ${new Date().toISOString()}`,
+        },
+        null,
+        2,
+      );
+      const res = await wallet.resolveAuth({ payload: challenge });
 
-      // 3. Verify per NEP-641 — w_resolve_auth pinned to a single block,
-      // with NEP-413 fallback for regular accounts that don't implement it.
+      // 3. Resolve per NEP-641: the whole authorization tree is pinned to a
+      //    single final block; wallet contracts resolve through
+      //    `w_resolve_auth(path, authorization)`, regular accounts through a
+      //    full-access-key `AccessKeyAuthorization` verified offchain.
       setStatus(`Verifying for ${res.accountId}...`);
       const verification = await verifyResolveAuth({
         rpcUrl: RPC_URL,
         accountId: res.accountId,
-        purpose: "PROVE_OWNERSHIP",
-        recipient: "example.app",
         authorization: res.authorization,
       });
 

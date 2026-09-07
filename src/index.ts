@@ -13,8 +13,17 @@ export {
   verifyResolveAuth,
   type VerifyResolveAuthArgs,
   type VerifyResolveAuthResult,
-  type ResolveAuthPurpose,
 } from "./helpers/verifyResolveAuth";
+export { defaultResolveAuthViaSignMessage } from "./helpers/resolveAuth";
+export {
+  newOffchainMessage,
+  offchainMessageHash,
+  toNep413Payload,
+  nep413Recipient,
+  encodeAccessKeyAuthorization,
+  parseAccessKeyAuthorization,
+  verifyAccessKeyAuthorization,
+} from "./helpers/nep641";
 
 export type {
   FooterBranding,
@@ -26,6 +35,11 @@ export type {
   SignAndSendTransactionParams,
   SignAndSendTransactionsParams,
   SignDelegateActionsParams,
+  ResolveAuthParams,
+  ResolveAuthResponse,
+  Nep641JsonPayload,
+  Nep641OffchainMessage,
+  Nep641AccessKeyAuthorization,
   NearConnector_ConnectOptions,
   SignInAndSignMessageParams,
   Account,

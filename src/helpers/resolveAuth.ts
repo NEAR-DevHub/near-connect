@@ -4,69 +4,63 @@ import type {
   ResolveAuthParams,
   ResolveAuthResponse,
   SignInAndSignMessageParams,
-  SignedMessage,
 } from "../types";
+import { encodeAccessKeyAuthorization, newOffchainMessage, normalizeNep413Signature, toNep413Payload } from "./nep641";
 
 /**
- * NEP-641 default `resolveAuth` implementation, built on top of NEP-413
- * `signMessage`. Per NEP-641 §"NEP-413 fallback", the `purpose` is bound
- * into the signed material by prefixing the `recipient` field with
- * `"<PURPOSE>@"`. The dApp backend reconstructs the same prefix when it
- * cannot find `w_resolve_auth` on the account and falls back to NEP-413
- * verification.
+ * NEP-641 default `resolveAuth` for wallets controlled by full-access keys,
+ * built on top of NEP-413 `signMessage`.
  *
- * If the user is not yet signed in to the wallet, the helper uses
- * `signInAndSignMessage` to combine sign-in and authorization into a single
- * user gesture; otherwise it uses the standalone `signMessage` against the
- * already-connected account.
+ * Per NEP-641 §"Access-key authorization", the signed material is the
+ * `OffchainMessage` envelope `{ chain_id, signer_id, path: [], timestamp,
+ * payload }`, mapped onto NEP-413 as: `message` = payload, `nonce` = the
+ * envelope's canonical hash (binds every field), `recipient` =
+ * `"<chain_id>: <signer_id> @ <timestamp>"` (what NEP-413 wallets render).
  *
- * The returned `authorization` is a JSON-stringified NEP-413 `SignedMessage`
- * extended with the original `purpose`, `recipient`, and `payload` so the
- * dApp can fully reconstruct the verification input without out-of-band
- * context. The bound `recipient` used inside the NEP-413 signature is
- * `"<PURPOSE>@<recipient>"`.
+ * The envelope names the signer, so the account must be known *before*
+ * signing: a wallet that isn't signed in yet is signed in first (without
+ * adding a key), then asked to sign — two user gestures. Wallets that want a
+ * single gesture implement `resolveAuth` natively.
+ *
+ * The returned `authorization` is a JSON-stringified `AccessKeyAuthorization`
+ * the dApp verifies offchain against the account's full-access keys at a
+ * pinned block (see `verifyResolveAuth`). No contract is involved.
  */
 export async function defaultResolveAuthViaSignMessage(
-  wallet: Pick<NearWalletBase, "signMessage" | "signInAndSignMessage" | "getAccounts">,
+  wallet: Pick<NearWalletBase, "signIn" | "signMessage" | "getAccounts">,
   params: ResolveAuthParams,
 ): Promise<ResolveAuthResponse> {
-  const nonce = crypto.getRandomValues(new Uint8Array(32));
-  const boundRecipient = `${params.purpose}@${params.recipient}`;
-  const messageParams = { message: params.payload, recipient: boundRecipient, nonce };
+  const chainId = params.chainId ?? params.network ?? "mainnet";
 
-  const accounts = await wallet.getAccounts({ network: params.network }).catch(() => []);
-  const isConnected = !!(accounts?.length && accounts[0]?.accountId);
+  let accounts = await wallet.getAccounts({ network: params.network }).catch(() => []);
+  if (!accounts?.length || !accounts[0]?.accountId) {
+    accounts = await wallet.signIn({ network: params.network });
+  }
+  const accountId = accounts?.[0]?.accountId;
+  if (!accountId) throw new Error("Wallet returned no account during sign-in");
 
-  let signed: SignedMessage;
-  if (!isConnected) {
-    const result = await wallet.signInAndSignMessage({
-      network: params.network,
-      messageParams,
-    });
-    if (!result?.length || !result[0]?.signedMessage) {
-      throw new Error("Wallet returned no signed message during sign-in");
-    }
-    signed = result[0].signedMessage;
-  } else {
-    signed = await wallet.signMessage({ ...messageParams, network: params.network });
+  const msg = newOffchainMessage({ chainId, signerId: accountId, payload: params.payload });
+  const nep413 = toNep413Payload(msg);
+
+  const signed = await wallet.signMessage({
+    message: nep413.message,
+    recipient: nep413.recipient,
+    nonce: nep413.nonce,
+    network: params.network,
+    signerId: accountId,
+  });
+  if (signed.accountId && signed.accountId !== accountId) {
+    throw new Error(`Wallet signed as ${signed.accountId}, expected ${accountId}`);
   }
 
-  // NEP-641 §"NEP-413 fallback": the authorization blob is a NEP-413
-  // `SignedMessage` so a generic resolver can verify it without out-of-band
-  // context. Includes the SignedMessagePayload fields (message, recipient,
-  // nonce, callbackUrl) needed to recompute the borsh hash.
-  const authorization = JSON.stringify({
-    accountId: signed.accountId,
-    publicKey: signed.publicKey,
-    signature: signed.signature,
-    message: params.payload,
-    recipient: boundRecipient,
-    nonce: bytesToBase64(nonce),
-    callbackUrl: null,
-    state: null,
+  const authorization = encodeAccessKeyAuthorization({
+    msg,
+    via: { schema: "nep413", extra: {} },
+    access_key: signed.publicKey,
+    signature: normalizeNep413Signature(signed.signature, signed.publicKey),
   });
 
-  return { accountId: signed.accountId, authorization };
+  return { accountId, authorization };
 }
 
 /**
@@ -88,12 +82,6 @@ export async function polyfillSignInAndSignMessage(
     network: data.network,
   });
   return accounts.map((account) => ({ ...account, signedMessage }));
-}
-
-function bytesToBase64(bytes: Uint8Array): string {
-  let s = "";
-  for (const b of bytes) s += String.fromCharCode(b);
-  return btoa(s);
 }
 
 /**
