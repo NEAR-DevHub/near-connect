@@ -176,7 +176,9 @@ export function nep413Hash(payload: Nep413Payload): Uint8Array {
 
 // ─── Keys & signatures ───────────────────────────────────────────────────────
 
-export type Curve = "ed25519" | "secp256k1";
+const CURVES = ["ed25519", "secp256k1", "ml-dsa-65"] as const;
+
+export type Curve = (typeof CURVES)[number];
 
 export interface TypedBytes {
   curve: Curve;
@@ -186,8 +188,9 @@ export interface TypedBytes {
 function parseTyped(s: string, what: string, sizes: Record<Curve, number>): TypedBytes {
   const idx = s.indexOf(":");
   if (idx < 0) throw new Error(`${what} must be "<curve>:<base58>"`);
-  const curve = s.slice(0, idx);
-  if (curve !== "ed25519" && curve !== "secp256k1") throw new Error(`unsupported ${what} curve: ${curve}`);
+  const prefix = s.slice(0, idx);
+  const curve = CURVES.find((c) => c === prefix);
+  if (!curve) throw new Error(`unsupported ${what} curve: ${prefix}`);
   const bytes = base58.decode(s.slice(idx + 1));
   if (bytes.length !== sizes[curve]) {
     throw new Error(`${curve} ${what} must be ${sizes[curve]} bytes, got ${bytes.length}`);
@@ -195,14 +198,17 @@ function parseTyped(s: string, what: string, sizes: Record<Curve, number>): Type
   return { curve, bytes };
 }
 
-/** `ed25519:<base58 32 bytes>` | `secp256k1:<base58 64 bytes, uncompressed without prefix>`. */
+/**
+ * `ed25519:<base58 32 bytes>` | `secp256k1:<base58 64 bytes, uncompressed without prefix>` |
+ * `ml-dsa-65:<base58 1952 bytes>`.
+ */
 export function parsePublicKey(s: string): TypedBytes {
-  return parseTyped(s, "public key", { ed25519: 32, secp256k1: 64 });
+  return parseTyped(s, "public key", { ed25519: 32, secp256k1: 64, "ml-dsa-65": 1952 });
 }
 
-/** `ed25519:<base58 64 bytes>` | `secp256k1:<base58 65 bytes r||s||v>`. */
+/** `ed25519:<base58 64 bytes>` | `secp256k1:<base58 65 bytes r||s||v>` | `ml-dsa-65:<base58 3309 bytes>`. */
 export function parseSignature(s: string): TypedBytes {
-  return parseTyped(s, "signature", { ed25519: 64, secp256k1: 65 });
+  return parseTyped(s, "signature", { ed25519: 64, secp256k1: 65, "ml-dsa-65": 3309 });
 }
 
 export function encodeSignature(curve: Curve, bytes: Uint8Array): string {
@@ -220,21 +226,30 @@ export function normalizeNep413Signature(signature: string, publicKey: string): 
   return encodeSignature(curve, raw);
 }
 
-/** Verify `signature` over `hash` (32 bytes) for `publicKey`; curves MUST match. */
+/**
+ * Verify `signature` over `hash` (32 bytes) for `publicKey`; curves MUST match.
+ * `ml-dsa-65` isn't verified here, so it never passes — dApps verify those
+ * server-side.
+ */
 export function verifyHash(hash: Uint8Array, publicKey: TypedBytes, signature: TypedBytes): boolean {
   if (publicKey.curve !== signature.curve) return false;
   try {
-    if (publicKey.curve === "ed25519") {
-      return ed25519.verify(signature.bytes, hash, publicKey.bytes);
+    switch (publicKey.curve) {
+      case "ed25519":
+        return ed25519.verify(signature.bytes, hash, publicKey.bytes);
+      case "secp256k1": {
+        // NEAR secp256k1: 65-byte recoverable signature (r || s || v) over an
+        // uncompressed 64-byte public key (no 0x04 prefix).
+        const recovered = secp256k1.Signature.fromCompact(signature.bytes.slice(0, 64))
+          .addRecoveryBit(signature.bytes[64])
+          .recoverPublicKey(hash)
+          .toRawBytes(false)
+          .slice(1);
+        return recovered.length === 64 && recovered.every((b, i) => b === publicKey.bytes[i]);
+      }
+      case "ml-dsa-65":
+        return false;
     }
-    // NEAR secp256k1: 65-byte recoverable signature (r || s || v) over an
-    // uncompressed 64-byte public key (no 0x04 prefix).
-    const recovered = secp256k1.Signature.fromCompact(signature.bytes.slice(0, 64))
-      .addRecoveryBit(signature.bytes[64])
-      .recoverPublicKey(hash)
-      .toRawBytes(false)
-      .slice(1);
-    return recovered.length === 64 && recovered.every((b, i) => b === publicKey.bytes[i]);
   } catch {
     return false;
   }
@@ -242,12 +257,19 @@ export function verifyHash(hash: Uint8Array, publicKey: TypedBytes, signature: T
 
 /**
  * Implicit account ID derived from a public key: hex(ed25519 key), or
- * `0x` + last 20 bytes of keccak256(uncompressed secp256k1 key).
+ * `0x` + last 20 bytes of keccak256(uncompressed secp256k1 key). `ml-dsa-65`
+ * keys have no implicit account.
  */
-export function implicitAccountId(publicKey: TypedBytes): string {
+export function implicitAccountId(publicKey: TypedBytes): string | null {
   const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
-  if (publicKey.curve === "ed25519") return hex(publicKey.bytes);
-  return `0x${hex(keccak_256(publicKey.bytes).slice(12, 32))}`;
+  switch (publicKey.curve) {
+    case "ed25519":
+      return hex(publicKey.bytes);
+    case "secp256k1":
+      return `0x${hex(keccak_256(publicKey.bytes).slice(12, 32))}`;
+    case "ml-dsa-65":
+      return null;
+  }
 }
 
 // ─── Access-key authorization ────────────────────────────────────────────────
