@@ -5,6 +5,8 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 const url_1 = require("../helpers/url");
 const uuid_1 = require("../helpers/uuid");
+const clipboard_1 = require("../helpers/clipboard");
+const telegram_1 = require("../helpers/telegram");
 const iframe_1 = __importDefault(require("./iframe"));
 const cacheId = (0, uuid_1.uuid4)();
 // ─── Injected Ethereum provider discovery ────────────────────────────────────
@@ -282,6 +284,17 @@ class SandboxExecutor {
             }
             return;
         }
+        if (event.data.method === "clipboard.writeText") {
+            this.assertPermissions(iframe, "clipboardWrite", event);
+            try {
+                await (0, clipboard_1.copyText)(event.data.params.text);
+                success(null);
+            }
+            catch (e) {
+                failed(e);
+            }
+            return;
+        }
         if (event.data.method === "external") {
             this.assertPermissions(iframe, "external", event);
             try {
@@ -303,10 +316,14 @@ class SandboxExecutor {
         }
         if (event.data.method === "open") {
             this.assertPermissions(iframe, "allowsOpen", event);
-            // Open in Telegram Mini App
-            const tgapp = typeof window !== "undefined" ? window?.Telegram?.WebApp : null;
-            if (tgapp && event.data.params.url.startsWith("https://t.me")) {
-                tgapp.openTelegramLink(event.data.params.url);
+            // Telegram Mini App blocks window.open, links go through Telegram (no panel to track)
+            const tgUrl = (0, url_1.parseUrl)(event.data.params.url);
+            if (tgUrl && tgUrl.protocol === "https:" && (0, telegram_1.isTelegramMiniApp)()) {
+                if (tgUrl.hostname === "t.me")
+                    (0, telegram_1.openTelegramLink)(tgUrl);
+                else
+                    (0, telegram_1.openExternalLink)(tgUrl);
+                success(null);
                 return;
             }
             const panel = window.open(event.data.params.url, "_blank", event.data.params.features);
@@ -507,15 +524,24 @@ class SandboxExecutor {
         if (!url)
             throw new Error("Invalid executor URL");
         url.searchParams.set("nonce", cacheId);
-        const newVersion = await fetch(url.toString()).then((res) => res.text());
+        const newVersion = await fetch(url.toString()).then((res) => {
+            // An error page (raw.githubusercontent 429/5xx) must not be cached and run as the executor
+            if (!res.ok)
+                throw new Error(`Failed to load executor: ${res.status}`);
+            return res.text();
+        });
         this.connector.logger?.log(`New version of code fetched`);
         this.actualCode = newVersion;
         if (newVersion === currentVersion) {
             this.connector.logger?.log(`New version of code is the same as the current version`);
             return this.actualCode;
         }
-        await this.connector.db.setItem(`${this.manifest.id}:${this.manifest.version}`, newVersion);
-        this.connector.logger?.log(`New version of code saved to cache`);
+        // The cache is optional: IndexedDB fails on iOS Safari ("Connection to Indexed Database server lost", private mode),
+        // and a failed write must not keep the wallet from opening
+        await this.connector.db
+            .setItem(`${this.manifest.id}:${this.manifest.version}`, newVersion)
+            .then(() => this.connector.logger?.log(`New version of code saved to cache`))
+            .catch((e) => this.connector.logger?.log(`Failed to cache new version of code`, e));
         return newVersion;
     }
     async loadCode() {

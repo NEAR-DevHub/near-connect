@@ -25,10 +25,11 @@ exports.implicitAccountId = implicitAccountId;
 exports.encodeAccessKeyAuthorization = encodeAccessKeyAuthorization;
 exports.parseAccessKeyAuthorization = parseAccessKeyAuthorization;
 exports.verifyAccessKeyAuthorization = verifyAccessKeyAuthorization;
-const ed25519_1 = require("@noble/curves/ed25519");
-const secp256k1_1 = require("@noble/curves/secp256k1");
-const sha2_1 = require("@noble/hashes/sha2");
-const sha3_1 = require("@noble/hashes/sha3");
+const ed25519_js_1 = require("@noble/curves/ed25519.js");
+const secp256k1_js_1 = require("@noble/curves/secp256k1.js");
+const sha2_js_1 = require("@noble/hashes/sha2.js");
+const sha3_js_1 = require("@noble/hashes/sha3.js");
+const ml_dsa_js_1 = require("@noble/post-quantum/ml-dsa.js");
 const base_1 = require("@scure/base");
 /** NEP-413 prefix tag: `2^31 + 413`. */
 exports.NEP413_TAG = 2147484061;
@@ -137,7 +138,7 @@ function borshOffchainMessage(msg) {
 }
 /** `SHA3-256(b"NEAR_NEP641_OFFCHAIN_MESSAGE/V1" || borsh(msg))`. */
 function offchainMessageHash(msg) {
-    return sha3_1.sha3_256
+    return sha3_js_1.sha3_256
         .create()
         .update(new TextEncoder().encode(exports.NEP641_DOMAIN_SEPARATOR))
         .update(borshOffchainMessage(msg))
@@ -171,28 +172,34 @@ function nep413Hash(payload) {
     w.writeBytes(payload.nonce);
     w.writeString(payload.recipient);
     w.writeOptionString(payload.callbackUrl ?? null);
-    return (0, sha2_1.sha256)(w.toBytes());
+    return (0, sha2_js_1.sha256)(w.toBytes());
 }
+// ─── Keys & signatures ───────────────────────────────────────────────────────
+const CURVES = ["ed25519", "secp256k1", "ml-dsa-65"];
 function parseTyped(s, what, sizes) {
     const idx = s.indexOf(":");
     if (idx < 0)
         throw new Error(`${what} must be "<curve>:<base58>"`);
-    const curve = s.slice(0, idx);
-    if (curve !== "ed25519" && curve !== "secp256k1")
-        throw new Error(`unsupported ${what} curve: ${curve}`);
+    const prefix = s.slice(0, idx);
+    const curve = CURVES.find((c) => c === prefix);
+    if (!curve)
+        throw new Error(`unsupported ${what} curve: ${prefix}`);
     const bytes = base_1.base58.decode(s.slice(idx + 1));
     if (bytes.length !== sizes[curve]) {
         throw new Error(`${curve} ${what} must be ${sizes[curve]} bytes, got ${bytes.length}`);
     }
     return { curve, bytes };
 }
-/** `ed25519:<base58 32 bytes>` | `secp256k1:<base58 64 bytes, uncompressed without prefix>`. */
+/**
+ * `ed25519:<base58 32 bytes>` | `secp256k1:<base58 64 bytes, uncompressed without prefix>` |
+ * `ml-dsa-65:<base58 1952 bytes>`.
+ */
 function parsePublicKey(s) {
-    return parseTyped(s, "public key", { ed25519: 32, secp256k1: 64 });
+    return parseTyped(s, "public key", { ed25519: 32, secp256k1: 64, "ml-dsa-65": 1952 });
 }
-/** `ed25519:<base58 64 bytes>` | `secp256k1:<base58 65 bytes r||s||v>`. */
+/** `ed25519:<base58 64 bytes>` | `secp256k1:<base58 65 bytes r||s||v>` | `ml-dsa-65:<base58 3309 bytes>`. */
 function parseSignature(s) {
-    return parseTyped(s, "signature", { ed25519: 64, secp256k1: 65 });
+    return parseTyped(s, "signature", { ed25519: 64, secp256k1: 65, "ml-dsa-65": 3309 });
 }
 function encodeSignature(curve, bytes) {
     return `${curve}:${base_1.base58.encode(bytes)}`;
@@ -208,22 +215,31 @@ function normalizeNep413Signature(signature, publicKey) {
     const raw = Uint8Array.from(atob(signature), (c) => c.charCodeAt(0));
     return encodeSignature(curve, raw);
 }
-/** Verify `signature` over `hash` (32 bytes) for `publicKey`; curves MUST match. */
+/**
+ * Verify `signature` over `hash` (32 bytes) for `publicKey`; curves MUST match.
+ * `ml-dsa-65` isn't verified here, so it never passes — dApps verify those
+ * server-side.
+ */
 function verifyHash(hash, publicKey, signature) {
     if (publicKey.curve !== signature.curve)
         return false;
     try {
-        if (publicKey.curve === "ed25519") {
-            return ed25519_1.ed25519.verify(signature.bytes, hash, publicKey.bytes);
+        switch (publicKey.curve) {
+            case "ed25519":
+                return ed25519_js_1.ed25519.verify(signature.bytes, hash, publicKey.bytes);
+            case "secp256k1": {
+                // NEAR secp256k1: 65-byte recoverable signature (r || s || v) over an
+                // uncompressed 64-byte public key (no 0x04 prefix).
+                const recovered = secp256k1_js_1.secp256k1.Signature.fromBytes(signature.bytes.slice(0, 64), 'compact')
+                    .addRecoveryBit(signature.bytes[64])
+                    .recoverPublicKey(hash)
+                    .toBytes(false)
+                    .slice(1);
+                return recovered.length === 64 && recovered.every((b, i) => b === publicKey.bytes[i]);
+            }
+            case "ml-dsa-65":
+                return ml_dsa_js_1.ml_dsa65.verify(signature.bytes, hash, publicKey.bytes);
         }
-        // NEAR secp256k1: 65-byte recoverable signature (r || s || v) over an
-        // uncompressed 64-byte public key (no 0x04 prefix).
-        const recovered = secp256k1_1.secp256k1.Signature.fromCompact(signature.bytes.slice(0, 64))
-            .addRecoveryBit(signature.bytes[64])
-            .recoverPublicKey(hash)
-            .toRawBytes(false)
-            .slice(1);
-        return recovered.length === 64 && recovered.every((b, i) => b === publicKey.bytes[i]);
     }
     catch {
         return false;
@@ -231,13 +247,19 @@ function verifyHash(hash, publicKey, signature) {
 }
 /**
  * Implicit account ID derived from a public key: hex(ed25519 key), or
- * `0x` + last 20 bytes of keccak256(uncompressed secp256k1 key).
+ * `0x` + last 20 bytes of keccak256(uncompressed secp256k1 key). `ml-dsa-65`
+ * keys have no implicit account.
  */
 function implicitAccountId(publicKey) {
     const hex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
-    if (publicKey.curve === "ed25519")
-        return hex(publicKey.bytes);
-    return `0x${hex((0, sha3_1.keccak_256)(publicKey.bytes).slice(12, 32))}`;
+    switch (publicKey.curve) {
+        case "ed25519":
+            return hex(publicKey.bytes);
+        case "secp256k1":
+            return `0x${hex((0, sha3_js_1.keccak_256)(publicKey.bytes).slice(12, 32))}`;
+        case "ml-dsa-65":
+            return null;
+    }
 }
 // ─── Access-key authorization ────────────────────────────────────────────────
 /** Serialize an access-key authorization to the blob string. */

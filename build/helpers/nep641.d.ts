@@ -58,14 +58,18 @@ export interface Nep413Payload {
 export declare function toNep413Payload(msg: Nep641OffchainMessage, callbackUrl?: string | null): Nep413Payload;
 /** NEP-413 hash: `sha256(tag ++ borsh(payload))`. */
 export declare function nep413Hash(payload: Nep413Payload): Uint8Array;
-export type Curve = "ed25519" | "secp256k1";
+declare const CURVES: readonly ["ed25519", "secp256k1", "ml-dsa-65"];
+export type Curve = (typeof CURVES)[number];
 export interface TypedBytes {
     curve: Curve;
     bytes: Uint8Array;
 }
-/** `ed25519:<base58 32 bytes>` | `secp256k1:<base58 64 bytes, uncompressed without prefix>`. */
+/**
+ * `ed25519:<base58 32 bytes>` | `secp256k1:<base58 64 bytes, uncompressed without prefix>` |
+ * `ml-dsa-65:<base58 1952 bytes>`.
+ */
 export declare function parsePublicKey(s: string): TypedBytes;
-/** `ed25519:<base58 64 bytes>` | `secp256k1:<base58 65 bytes r||s||v>`. */
+/** `ed25519:<base58 64 bytes>` | `secp256k1:<base58 65 bytes r||s||v>` | `ml-dsa-65:<base58 3309 bytes>`. */
 export declare function parseSignature(s: string): TypedBytes;
 export declare function encodeSignature(curve: Curve, bytes: Uint8Array): string;
 /**
@@ -73,13 +77,18 @@ export declare function encodeSignature(curve: Curve, bytes: Uint8Array): string
  * canonical raw base64 (ed25519) or the typed `<curve>:<base58>` form.
  */
 export declare function normalizeNep413Signature(signature: string, publicKey: string): string;
-/** Verify `signature` over `hash` (32 bytes) for `publicKey`; curves MUST match. */
+/**
+ * Verify `signature` over `hash` (32 bytes) for `publicKey`; curves MUST match.
+ * `ml-dsa-65` isn't verified here, so it never passes — dApps verify those
+ * server-side.
+ */
 export declare function verifyHash(hash: Uint8Array, publicKey: TypedBytes, signature: TypedBytes): boolean;
 /**
  * Implicit account ID derived from a public key: hex(ed25519 key), or
- * `0x` + last 20 bytes of keccak256(uncompressed secp256k1 key).
+ * `0x` + last 20 bytes of keccak256(uncompressed secp256k1 key). `ml-dsa-65`
+ * keys have no implicit account.
  */
-export declare function implicitAccountId(publicKey: TypedBytes): string;
+export declare function implicitAccountId(publicKey: TypedBytes): string | null;
 /** Serialize an access-key authorization to the blob string. */
 export declare function encodeAccessKeyAuthorization(auth: Nep641AccessKeyAuthorization): string;
 /**
@@ -90,3 +99,4 @@ export declare function encodeAccessKeyAuthorization(auth: Nep641AccessKeyAuthor
 export declare function parseAccessKeyAuthorization(blob: string): Nep641AccessKeyAuthorization | null;
 /** Verify the signature of an access-key authorization per its `via` schema. */
 export declare function verifyAccessKeyAuthorization(auth: Nep641AccessKeyAuthorization): boolean;
+export {};
