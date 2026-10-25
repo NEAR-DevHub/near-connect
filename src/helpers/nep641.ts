@@ -5,10 +5,11 @@
 //
 // Spec: https://github.com/near/NEPs/blob/master/neps/nep-0641.md
 
-import { ed25519 } from "@noble/curves/ed25519";
-import { secp256k1 } from "@noble/curves/secp256k1";
-import { sha256 } from "@noble/hashes/sha2";
-import { sha3_256, keccak_256 } from "@noble/hashes/sha3";
+import { ed25519 } from "@noble/curves/ed25519.js";
+import { secp256k1 } from "@noble/curves/secp256k1.js";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { sha3_256, keccak_256 } from "@noble/hashes/sha3.js";
+import { ml_dsa65 } from '@noble/post-quantum/ml-dsa.js';
 import { base58 } from "@scure/base";
 
 import type { Nep641AccessKeyAuthorization, Nep641OffchainMessage } from "../types";
@@ -240,15 +241,15 @@ export function verifyHash(hash: Uint8Array, publicKey: TypedBytes, signature: T
       case "secp256k1": {
         // NEAR secp256k1: 65-byte recoverable signature (r || s || v) over an
         // uncompressed 64-byte public key (no 0x04 prefix).
-        const recovered = secp256k1.Signature.fromCompact(signature.bytes.slice(0, 64))
+        const recovered = secp256k1.Signature.fromBytes(signature.bytes.slice(0, 64), 'compact')
           .addRecoveryBit(signature.bytes[64])
           .recoverPublicKey(hash)
-          .toRawBytes(false)
+          .toBytes(false)
           .slice(1);
         return recovered.length === 64 && recovered.every((b, i) => b === publicKey.bytes[i]);
       }
       case "ml-dsa-65":
-        return false;
+        return ml_dsa65.verify(signature.bytes, hash, publicKey.bytes);
     }
   } catch {
     return false;
