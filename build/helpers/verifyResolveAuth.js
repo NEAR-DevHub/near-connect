@@ -4,8 +4,9 @@
 // the NEP-413 fallback (§"NEP-413 fallback").
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.verifyResolveAuth = verifyResolveAuth;
-const ed25519_1 = require("@noble/curves/ed25519");
-const sha2_1 = require("@noble/hashes/sha2");
+const ed25519_js_1 = require("@noble/curves/ed25519.js");
+const sha2_js_1 = require("@noble/hashes/sha2.js");
+const ml_dsa_js_1 = require("@noble/post-quantum/ml-dsa.js");
 const base_1 = require("@scure/base");
 const NEP413_TAG = 2147484061; // 2^31 + 413
 // ─── RPC ─────────────────────────────────────────────────────────────────────
@@ -123,31 +124,59 @@ function nep413Hash(msg) {
     w.writeBytes(nonce);
     w.writeString(msg.recipient);
     w.writeOptionString(msg.callbackUrl ?? null);
-    return (0, sha2_1.sha256)(w.toBytes());
+    return (0, sha2_js_1.sha256)(w.toBytes());
 }
-// ─── ed25519 key/signature decoding ──────────────────────────────────────────
-function decodeEd25519PublicKey(s) {
-    // Accepts "ed25519:<base58>" (NEAR canonical form).
-    if (!s.startsWith("ed25519:"))
-        throw new Error("publicKey must start with 'ed25519:'");
-    const raw = base_1.base58.decode(s.slice("ed25519:".length));
-    if (raw.length !== 32)
-        throw new Error(`ed25519 public key must be 32 bytes, got ${raw.length}`);
-    return raw;
+// ─── Key/signature decoding ──────────────────────────────────────────────────
+const CURVES = ["ed25519", "ml-dsa-65"];
+const PUBLIC_KEY_SIZES = { ed25519: 32, "ml-dsa-65": 1952 };
+const SIGNATURE_SIZES = { ed25519: 64, "ml-dsa-65": 3309 };
+function decodePublicKey(s) {
+    // Accepts "<curve>:<base58>" (NEAR canonical form).
+    const idx = s.indexOf(":");
+    if (idx < 0)
+        throw new Error('publicKey must be "<curve>:<base58>"');
+    const prefix = s.slice(0, idx);
+    const curve = CURVES.find((c) => c === prefix);
+    if (!curve)
+        throw new Error(`unsupported public key curve: ${prefix}`);
+    const bytes = base_1.base58.decode(s.slice(idx + 1));
+    if (bytes.length !== PUBLIC_KEY_SIZES[curve]) {
+        throw new Error(`${curve} public key must be ${PUBLIC_KEY_SIZES[curve]} bytes, got ${bytes.length}`);
+    }
+    return { curve, bytes };
 }
-function decodeEd25519Signature(s) {
+function decodeSignature(s, curve) {
     // Accept either raw base64 (NEP-413 canonical form for signMessage output)
-    // or "ed25519:<base58>" for callers that pre-encoded.
+    // or "<curve>:<base58>" for callers that pre-encoded; the curve comes from
+    // the public key.
     let raw;
-    if (s.startsWith("ed25519:")) {
-        raw = base_1.base58.decode(s.slice("ed25519:".length));
+    const idx = s.indexOf(":");
+    if (idx >= 0) {
+        const prefix = s.slice(0, idx);
+        if (prefix !== curve)
+            throw new Error(`signature curve ${prefix} does not match public key curve ${curve}`);
+        raw = base_1.base58.decode(s.slice(idx + 1));
     }
     else {
         raw = base_1.base64.decode(s);
     }
-    if (raw.length !== 64)
-        throw new Error(`ed25519 signature must be 64 bytes, got ${raw.length}`);
+    if (raw.length !== SIGNATURE_SIZES[curve]) {
+        throw new Error(`${curve} signature must be ${SIGNATURE_SIZES[curve]} bytes, got ${raw.length}`);
+    }
     return raw;
+}
+function verifyHash(hash, publicKey, signature) {
+    try {
+        switch (publicKey.curve) {
+            case "ed25519":
+                return ed25519_js_1.ed25519.verify(signature, hash, publicKey.bytes);
+            case "ml-dsa-65":
+                return ml_dsa_js_1.ml_dsa65.verify(signature, hash, publicKey.bytes);
+        }
+    }
+    catch {
+        return false;
+    }
 }
 // ─── NEP-413 fallback ────────────────────────────────────────────────────────
 async function nep413Fallback(rpcUrl, accountId, purpose, recipient, authorization, blockId) {
@@ -170,7 +199,7 @@ async function nep413Fallback(rpcUrl, accountId, purpose, recipient, authorizati
     if (!keys.some((k) => k.public_key === msg.publicKey)) {
         return { status: "INVALID", errorMessage: "public key not registered on account at pinned block" };
     }
-    // Verify ed25519 signature against the precomputed NEP-413 hash.
+    // Verify the signature against the precomputed NEP-413 hash.
     let hash;
     try {
         hash = nep413Hash(msg);
@@ -181,13 +210,13 @@ async function nep413Fallback(rpcUrl, accountId, purpose, recipient, authorizati
     let signature;
     let publicKey;
     try {
-        signature = decodeEd25519Signature(msg.signature);
-        publicKey = decodeEd25519PublicKey(msg.publicKey);
+        publicKey = decodePublicKey(msg.publicKey);
+        signature = decodeSignature(msg.signature, publicKey.curve);
     }
     catch (e) {
         return { status: "INVALID", errorMessage: e.message };
     }
-    if (!ed25519_1.ed25519.verify(signature, hash, publicKey)) {
+    if (!verifyHash(hash, publicKey, signature)) {
         return { status: "INVALID", errorMessage: "bad signature" };
     }
     return { status: "RESOLVED", payload: msg.message };

@@ -6,6 +6,8 @@ declare class SandboxExecutor {
     readonly manifest: WalletManifest;
     private activePanels;
     readonly storageSpace: string;
+    /** The `keepAlive` iframe, reused across calls (see WalletPermissions.keepAlive). */
+    private keptAlive;
     constructor(connector: NearConnector, manifest: WalletManifest);
     checkPermissions(action: keyof WalletPermissions, params?: {
         url?: string;
@@ -16,6 +18,10 @@ declare class SandboxExecutor {
     private actualCode;
     checkNewVersion(executor: SandboxExecutor, currentVersion: string | null): Promise<string>;
     loadCode(): Promise<string>;
+    private createIframe;
+    /** A fresh iframe per call, or the kept-alive one for `keepAlive` wallets. */
+    private acquireIframe;
+    private releaseIframe;
     call<T>(method: string, params: any): Promise<T>;
     getAllStorage(): Promise<Record<string, any>>;
     clearStorage(): Promise<void>;

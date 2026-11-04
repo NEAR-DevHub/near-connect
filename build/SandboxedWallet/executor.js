@@ -5,6 +5,8 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 const url_1 = require("../helpers/url");
 const uuid_1 = require("../helpers/uuid");
+const clipboard_1 = require("../helpers/clipboard");
+const telegram_1 = require("../helpers/telegram");
 const iframe_1 = __importDefault(require("./iframe"));
 const cacheId = (0, uuid_1.uuid4)();
 // ─── Injected Ethereum provider discovery ────────────────────────────────────
@@ -82,6 +84,8 @@ class SandboxExecutor {
     manifest;
     activePanels = {};
     storageSpace;
+    /** The `keepAlive` iframe, reused across calls (see WalletPermissions.keepAlive). */
+    keptAlive = null;
     constructor(connector, manifest) {
         this.connector = connector;
         this.manifest = manifest;
@@ -282,6 +286,17 @@ class SandboxExecutor {
             }
             return;
         }
+        if (event.data.method === "clipboard.writeText") {
+            this.assertPermissions(iframe, "clipboardWrite", event);
+            try {
+                await (0, clipboard_1.copyText)(event.data.params.text);
+                success(null);
+            }
+            catch (e) {
+                failed(e);
+            }
+            return;
+        }
         if (event.data.method === "external") {
             this.assertPermissions(iframe, "external", event);
             try {
@@ -303,10 +318,14 @@ class SandboxExecutor {
         }
         if (event.data.method === "open") {
             this.assertPermissions(iframe, "allowsOpen", event);
-            // Open in Telegram Mini App
-            const tgapp = typeof window !== "undefined" ? window?.Telegram?.WebApp : null;
-            if (tgapp && event.data.params.url.startsWith("https://t.me")) {
-                tgapp.openTelegramLink(event.data.params.url);
+            // Telegram Mini App blocks window.open, links go through Telegram (no panel to track)
+            const tgUrl = (0, url_1.parseUrl)(event.data.params.url);
+            if (tgUrl && tgUrl.protocol === "https:" && (0, telegram_1.isTelegramMiniApp)()) {
+                if (tgUrl.hostname === "t.me")
+                    (0, telegram_1.openTelegramLink)(tgUrl);
+                else
+                    (0, telegram_1.openExternalLink)(tgUrl);
+                success(null);
                 return;
             }
             const panel = window.open(event.data.params.url, "_blank", event.data.params.features);
@@ -507,15 +526,24 @@ class SandboxExecutor {
         if (!url)
             throw new Error("Invalid executor URL");
         url.searchParams.set("nonce", cacheId);
-        const newVersion = await fetch(url.toString()).then((res) => res.text());
+        const newVersion = await fetch(url.toString()).then((res) => {
+            // An error page (raw.githubusercontent 429/5xx) must not be cached and run as the executor
+            if (!res.ok)
+                throw new Error(`Failed to load executor: ${res.status}`);
+            return res.text();
+        });
         this.connector.logger?.log(`New version of code fetched`);
         this.actualCode = newVersion;
         if (newVersion === currentVersion) {
             this.connector.logger?.log(`New version of code is the same as the current version`);
             return this.actualCode;
         }
-        await this.connector.db.setItem(`${this.manifest.id}:${this.manifest.version}`, newVersion);
-        this.connector.logger?.log(`New version of code saved to cache`);
+        // The cache is optional: IndexedDB fails on iOS Safari ("Connection to Indexed Database server lost", private mode),
+        // and a failed write must not keep the wallet from opening
+        await this.connector.db
+            .setItem(`${this.manifest.id}:${this.manifest.version}`, newVersion)
+            .then(() => this.connector.logger?.log(`New version of code saved to cache`))
+            .catch((e) => this.connector.logger?.log(`Failed to cache new version of code`, e));
         return newVersion;
     }
     async loadCode() {
@@ -526,23 +554,60 @@ class SandboxExecutor {
             return cachedCode;
         return await task;
     }
-    async call(method, params) {
-        this.connector.logger?.log(`Add to queue`, method, params);
-        // return this.queue.enqueue(async () => {
-        this.connector.logger?.log(`Calling method`, method, params);
+    async createIframe() {
         const code = await this.loadCode();
         this.connector.logger?.log(`Code loaded, preparing`);
         const iframe = new iframe_1.default(this, code, this._onMessage, this.connector.cspNonce);
         this.connector.logger?.log(`Code loaded, iframe initialized`);
         await iframe.readyPromise;
         this.connector.logger?.log(`Iframe ready`);
+        return iframe;
+    }
+    /** A fresh iframe per call, or the kept-alive one for `keepAlive` wallets. */
+    acquireIframe() {
+        if (!this.manifest.permissions.keepAlive)
+            return this.createIframe();
+        if (this.keptAlive)
+            return this.keptAlive.iframe;
+        const kept = { iframe: this.createIframe() };
+        this.keptAlive = kept;
+        kept.iframe.then((iframe) => {
+            kept.resolved = iframe;
+            // Closing the wallet modal ends it; the next call starts fresh.
+            iframe.on("close", () => {
+                if (this.keptAlive === kept)
+                    this.keptAlive = null;
+            });
+        }, () => {
+            if (this.keptAlive === kept)
+                this.keptAlive = null;
+        });
+        return kept.iframe;
+    }
+    releaseIframe(iframe, method) {
+        const kept = this.keptAlive?.resolved === iframe;
+        if (kept && method !== "wallet:signOut") {
+            iframe.hide();
+            return;
+        }
+        if (kept)
+            this.keptAlive = null;
+        iframe.dispose();
+    }
+    async call(method, params) {
+        this.connector.logger?.log(`Add to queue`, method, params);
+        // return this.queue.enqueue(async () => {
+        this.connector.logger?.log(`Calling method`, method, params);
+        const iframe = await this.acquireIframe();
         const id = (0, uuid_1.uuid4)();
         return new Promise((resolve, reject) => {
+            const onClose = () => reject(new Error("Wallet closed"));
             try {
                 const handler = (event) => {
                     if (event.data.id !== id || event.data.origin !== iframe.origin)
                         return;
-                    iframe.dispose();
+                    iframe.off("close", onClose);
+                    this.releaseIframe(iframe, method);
                     window.removeEventListener("message", handler);
                     this.connector.logger?.log("postMessage", { result: event.data, request: { method, params } });
                     if (event.data.status === "failed")
@@ -552,7 +617,7 @@ class SandboxExecutor {
                 };
                 window.addEventListener("message", handler);
                 iframe.postMessage({ method, params, id });
-                iframe.on("close", () => reject(new Error("Wallet closed")));
+                iframe.on("close", onClose);
             }
             catch (e) {
                 this.connector.logger?.log(`Iframe error`, e);

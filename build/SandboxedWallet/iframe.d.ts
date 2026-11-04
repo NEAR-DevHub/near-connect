@@ -10,6 +10,7 @@ declare class IframeExecutor {
     readonly readyPromise: Promise<void>;
     constructor(executor: SandboxExecutor, code: string, onMessage: (iframe: IframeExecutor, event: MessageEvent) => void, cspNonce?: string);
     on(event: "close", callback: () => void): void;
+    off(event: "close", callback: () => void): void;
     show(): void;
     hide(): void;
     postMessage(data: any): void;
