@@ -2,8 +2,9 @@
 // algorithm from nep-0641.md §"Caller-side resolution algorithm", including
 // the NEP-413 fallback (§"NEP-413 fallback").
 
-import { ed25519 } from "@noble/curves/ed25519";
-import { sha256 } from "@noble/hashes/sha2";
+import { ed25519 } from "@noble/curves/ed25519.js";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { ml_dsa65 } from "@noble/post-quantum/ml-dsa.js";
 import { base58, base64 } from "@scure/base";
 
 const NEP413_TAG = 2147484061; // 2^31 + 413
@@ -155,27 +156,64 @@ function nep413Hash(msg: Nep413SignedMessage): Uint8Array {
   return sha256(w.toBytes());
 }
 
-// ─── ed25519 key/signature decoding ──────────────────────────────────────────
+// ─── Key/signature decoding ──────────────────────────────────────────────────
 
-function decodeEd25519PublicKey(s: string): Uint8Array {
-  // Accepts "ed25519:<base58>" (NEAR canonical form).
-  if (!s.startsWith("ed25519:")) throw new Error("publicKey must start with 'ed25519:'");
-  const raw = base58.decode(s.slice("ed25519:".length));
-  if (raw.length !== 32) throw new Error(`ed25519 public key must be 32 bytes, got ${raw.length}`);
-  return raw;
+const CURVES = ["ed25519", "ml-dsa-65"] as const;
+
+type Curve = (typeof CURVES)[number];
+
+const PUBLIC_KEY_SIZES: Record<Curve, number> = { ed25519: 32, "ml-dsa-65": 1952 };
+const SIGNATURE_SIZES: Record<Curve, number> = { ed25519: 64, "ml-dsa-65": 3309 };
+
+interface PublicKey {
+  curve: Curve;
+  bytes: Uint8Array;
 }
 
-function decodeEd25519Signature(s: string): Uint8Array {
+function decodePublicKey(s: string): PublicKey {
+  // Accepts "<curve>:<base58>" (NEAR canonical form).
+  const idx = s.indexOf(":");
+  if (idx < 0) throw new Error('publicKey must be "<curve>:<base58>"');
+  const prefix = s.slice(0, idx);
+  const curve = CURVES.find((c) => c === prefix);
+  if (!curve) throw new Error(`unsupported public key curve: ${prefix}`);
+  const bytes = base58.decode(s.slice(idx + 1));
+  if (bytes.length !== PUBLIC_KEY_SIZES[curve]) {
+    throw new Error(`${curve} public key must be ${PUBLIC_KEY_SIZES[curve]} bytes, got ${bytes.length}`);
+  }
+  return { curve, bytes };
+}
+
+function decodeSignature(s: string, curve: Curve): Uint8Array {
   // Accept either raw base64 (NEP-413 canonical form for signMessage output)
-  // or "ed25519:<base58>" for callers that pre-encoded.
+  // or "<curve>:<base58>" for callers that pre-encoded; the curve comes from
+  // the public key.
   let raw: Uint8Array;
-  if (s.startsWith("ed25519:")) {
-    raw = base58.decode(s.slice("ed25519:".length));
+  const idx = s.indexOf(":");
+  if (idx >= 0) {
+    const prefix = s.slice(0, idx);
+    if (prefix !== curve) throw new Error(`signature curve ${prefix} does not match public key curve ${curve}`);
+    raw = base58.decode(s.slice(idx + 1));
   } else {
     raw = base64.decode(s);
   }
-  if (raw.length !== 64) throw new Error(`ed25519 signature must be 64 bytes, got ${raw.length}`);
+  if (raw.length !== SIGNATURE_SIZES[curve]) {
+    throw new Error(`${curve} signature must be ${SIGNATURE_SIZES[curve]} bytes, got ${raw.length}`);
+  }
   return raw;
+}
+
+function verifyHash(hash: Uint8Array, publicKey: PublicKey, signature: Uint8Array): boolean {
+  try {
+    switch (publicKey.curve) {
+      case "ed25519":
+        return ed25519.verify(signature, hash, publicKey.bytes);
+      case "ml-dsa-65":
+        return ml_dsa65.verify(signature, hash, publicKey.bytes);
+    }
+  } catch {
+    return false;
+  }
 }
 
 // ─── NEP-413 fallback ────────────────────────────────────────────────────────
@@ -209,7 +247,7 @@ async function nep413Fallback(
     return { status: "INVALID", errorMessage: "public key not registered on account at pinned block" };
   }
 
-  // Verify ed25519 signature against the precomputed NEP-413 hash.
+  // Verify the signature against the precomputed NEP-413 hash.
   let hash: Uint8Array;
   try {
     hash = nep413Hash(msg);
@@ -217,14 +255,14 @@ async function nep413Fallback(
     return { status: "INVALID", errorMessage: (e as Error).message };
   }
   let signature: Uint8Array;
-  let publicKey: Uint8Array;
+  let publicKey: PublicKey;
   try {
-    signature = decodeEd25519Signature(msg.signature);
-    publicKey = decodeEd25519PublicKey(msg.publicKey);
+    publicKey = decodePublicKey(msg.publicKey);
+    signature = decodeSignature(msg.signature, publicKey.curve);
   } catch (e) {
     return { status: "INVALID", errorMessage: (e as Error).message };
   }
-  if (!ed25519.verify(signature, hash, publicKey)) {
+  if (!verifyHash(hash, publicKey, signature)) {
     return { status: "INVALID", errorMessage: "bad signature" };
   }
 
