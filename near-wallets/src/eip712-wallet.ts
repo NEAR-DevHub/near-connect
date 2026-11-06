@@ -1046,18 +1046,26 @@ const Eip712Wallet = async () => {
         serializeFunctionCallAction("w_execute_signed", { msg, proof }, 300_000_000_000_000n, 1n),
       ];
 
-      // Build a DelegateAction signed by the relayer, but do NOT submit
-      const { keyPair, publicKey, nonce: relayerNonce, blockHash } = await getRelayerInfo();
+      // The delegate is only an envelope: the dApp relayer (Trezu's nt-be)
+      // never submits it as a meta-transaction. It takes the receiver and the
+      // w_execute_signed action out of it and sends them from its own account,
+      // and the user's authorization is the EIP-712 proof inside the call. The
+      // outer sender fields are never checked, so build them offline: a
+      // throwaway ed25519 key and placeholder nonce / max_block_height. This
+      // needs no RPC calls and works whether or not any key exists on the
+      // sponsor account. sender_id stays the sponsor so the payload keeps the
+      // shape relayers expect.
+      const keyPair = KeyPair.fromRandom("ed25519");
+      const publicKey = keyPair.getPublicKey();
 
       // DelegateAction: sender_id, receiver_id, actions, nonce, max_block_height, public_key
-      const maxBlockHeight = BigInt(relayerNonce) + 1000n;
       const w = new BorshWriter();
       w.writeString(RELAYER_ACCOUNT_ID);     // sender_id
       w.writeString(accountId!);             // receiver_id
       w.writeU32(rawActions.length);         // actions count
       for (const a of rawActions) for (const b of a) w.writeU8(b);
-      w.writeU64(BigInt(relayerNonce));      // nonce
-      w.writeU64(maxBlockHeight);            // max_block_height
+      w.writeU64(0n);                        // nonce (placeholder)
+      w.writeU64(0n);                        // max_block_height (placeholder)
       w.writeU8(0);                          // public_key: ED25519
       for (const b of publicKey.data) w.writeU8(b);
 
