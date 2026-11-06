@@ -211,8 +211,7 @@
         "storage": true,
         "usb": true,
         "hid": true,
-        "bluetooth": true,
-        "keepAlive": true
+        "bluetooth": true
       }
     },
     {
