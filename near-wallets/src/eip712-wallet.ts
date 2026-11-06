@@ -2,7 +2,7 @@ import { secp256k1 } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha2";
 import { keccak_256 } from "@noble/hashes/sha3";
 import { base58, base64, hex } from "@scure/base";
-import { KeyPair, PublicKey } from "@near-js/crypto";
+import { KeyPair, PublicKey, type KeyPairString } from "@near-js/crypto";
 import type { FinalExecutionOutcome } from "@near-js/types";
 import { baseDecode } from "@near-js/utils";
 import { WalletConnectModal } from "@walletconnect/modal";
@@ -23,9 +23,16 @@ const WALLET_CONTRACT_ACCOUNT_ID = "eip712-wallet-contract.trezu.near";
 const DEFAULT_TIMEOUT_SECS = 60 * 60;
 const DEFAULT_WALLET_ID = 0;
 
+// Wallet accounts are created and relayed through the account sponsor contract
+// on helper.trezu.near (https://github.com/NEAR-DevHub/near-account-sponsor).
+// This function-call key is public on purpose: it may only call
+// create_deterministic_account / relay_execute_signed on helper.trezu.near,
+// and the contract only creates or relays to wallets running allowlisted code.
 const RELAYER_ACCOUNT_ID = "helper.trezu.near";
-const RELAYER_PRIVATE_KEY =
-  "ed2" + "55" + "19:3P5ganuF3X4fZtLXQi9c" + "4bAtLnWnDiWPAYBZPedNEiGGwJTeCfu" + "Lds1B6JWohGYndqgeNEdYBmpWTfqNbqzwTU5R";
+const SPONSOR_PRIVATE_KEY = "ed25519:4gG3rn3tDDjDSBB5gbdVT1s4bbuD8XTntXKqSDW9D6xCxYzeyz5EwmLb7Dxq66KKqHs1fPj5f4n3ruurReDtnzCK";
+/** Gas for relay_execute_signed: the sponsor forwards all but its own overhead to w_execute_signed. */
+const RELAY_GAS = 300_000_000_000_000n;
+const CREATE_ACCOUNT_GAS = 30_000_000_000_000n;
 
 const STORAGE_KEY_ETH_ADDRESS = "eip712:ethAddress";
 const STORAGE_KEY_PUBLIC_KEY = "eip712:publicKey";
@@ -611,15 +618,6 @@ function connectorActionsToWalletPromises(
 
 const provider = new NearRpc(window.selector?.providers?.mainnet);
 
-function serializeStateInitAction(publicKey64: Uint8Array): Uint8Array {
-  const { serialized } = buildStateInit(publicKey64);
-  const w = new BorshWriter();
-  w.writeU8(11); // Action enum: StateInit = 11
-  for (const b of serialized) w.writeU8(b);
-  w.writeU128(0n);
-  return w.toBytes();
-}
-
 function serializeFunctionCallAction(methodName: string, args: object, gas: bigint, deposit: bigint): Uint8Array {
   const w = new BorshWriter();
   w.writeU8(2);
@@ -654,8 +652,8 @@ function serializeRawSignedTransaction(txBytes: Uint8Array, signatureBytes: Uint
   return w.toBytes();
 }
 
-async function getRelayerInfo() {
-  const kp = KeyPair.fromString(RELAYER_PRIVATE_KEY);
+async function getSponsorInfo() {
+  const kp = KeyPair.fromString(SPONSOR_PRIVATE_KEY as KeyPairString);
   const pk = kp.getPublicKey();
   const [block, ak] = await Promise.all([
     provider.block({ finality: "final" }),
@@ -664,22 +662,65 @@ async function getRelayerInfo() {
   return { keyPair: kp, publicKey: pk, nonce: ak.nonce + 1, blockHash: baseDecode(block.header.hash) };
 }
 
-async function signAndSendRawTransaction(receiverId: string, rawActions: Uint8Array[]): Promise<FinalExecutionOutcome> {
-  const { keyPair, publicKey, nonce, blockHash } = await getRelayerInfo();
-  const txBytes = serializeRawTransaction(RELAYER_ACCOUNT_ID, publicKey, receiverId, nonce, blockHash, rawActions);
-  const sig = keyPair.sign(sha256(txBytes));
-  const stxBytes = serializeRawSignedTransaction(txBytes, sig.signature);
-  return provider.sendJsonRpc<FinalExecutionOutcome>("send_tx", { signed_tx_base64: Buffer.from(stxBytes).toString("base64"), wait_until: "FINAL" });
+/**
+ * Call a method of the sponsor contract on helper.trezu.near, signed with its
+ * public function-call key. Every user shares that key, so the nonce is
+ * re-read and the call retried when another user took it first. Throws when
+ * the transaction or any of its receipts failed.
+ */
+async function callSponsor(methodName: string, args: object, gas: bigint): Promise<FinalExecutionOutcome> {
+  const action = serializeFunctionCallAction(methodName, args, gas, 0n);
+  for (let attempt = 0; ; attempt++) {
+    const { keyPair, publicKey, nonce, blockHash } = await getSponsorInfo();
+    const txNonce = nonce + Math.floor(Math.random() * 1000);
+    const txBytes = serializeRawTransaction(RELAYER_ACCOUNT_ID, publicKey, RELAYER_ACCOUNT_ID, txNonce, blockHash, [action]);
+    const sig = keyPair.sign(sha256(txBytes));
+    const stxBytes = serializeRawSignedTransaction(txBytes, sig.signature);
+    let outcome: FinalExecutionOutcome;
+    try {
+      outcome = await provider.sendJsonRpc<FinalExecutionOutcome>("send_tx", {
+        signed_tx_base64: Buffer.from(stxBytes).toString("base64"),
+        wait_until: "FINAL",
+      });
+    } catch (e) {
+      if (attempt < 3 && /InvalidNonce|nonce/i.test(String((e as Error)?.message ?? e))) continue;
+      throw e;
+    }
+    const status = outcome.status as any;
+    if (status && typeof status === "object" && "Failure" in status) {
+      throw new Error(`${methodName} failed: ${JSON.stringify(status.Failure)}`);
+    }
+    return outcome;
+  }
 }
 
+/** The wallet's StateInit as the sponsor contract takes it (near-sdk JSON). */
+function sponsorStateInit(publicKey64: Uint8Array) {
+  return {
+    V1: {
+      code: { account_id: WALLET_CONTRACT_ACCOUNT_ID },
+      // Empty key -> empty base64 string.
+      data: { "": base64.encode(buildWalletState(publicKey64)) },
+    },
+  };
+}
+
+/**
+ * Relay `w_execute_signed(msg, proof)` to the user's wallet account through
+ * the sponsor's `relay_execute_signed`. The wallet's StateInit always goes
+ * along: it creates the account if needed and is a no-op otherwise, and the
+ * sponsor derives the wallet account id from it. The JSON arguments are
+ * forwarded byte for byte.
+ */
 async function relayWalletContractCall(
-  walletAccountId: string, msg: WalletRequestMessage, proof: string,
-  publicKey64: Uint8Array, includeStateInit: boolean,
+  msg: WalletRequestMessage, proof: string, publicKey64: Uint8Array,
 ): Promise<FinalExecutionOutcome> {
-  const actions: Uint8Array[] = [];
-  if (includeStateInit) actions.push(serializeStateInitAction(publicKey64));
-  actions.push(serializeFunctionCallAction("w_execute_signed", { msg, proof }, 300_000_000_000_000n, 1n));
-  return signAndSendRawTransaction(walletAccountId, actions);
+  const args = new TextEncoder().encode(JSON.stringify({ msg, proof }));
+  return callSponsor(
+    "relay_execute_signed",
+    { state_init: { deterministic: sponsorStateInit(publicKey64) }, args: base64.encode(args) },
+    RELAY_GAS,
+  );
 }
 
 async function accountExists(accountId: string): Promise<boolean> {
@@ -687,50 +728,17 @@ async function accountExists(accountId: string): Promise<boolean> {
   catch { return false; }
 }
 
-const RELAYER_API_URL = "https://api.testenv.trezu.app/api/user/create";
-
-// near-api wire format: `{"V1": {"code": {"AccountId": "..."}, "data": {<b64>: <b64>}}}`.
-// See `DeterministicAccountStateInit` in near-api-types and the reference
-// handler at /mnt/treasury26/nt-be/src/handlers/user/create.rs.
-function buildStateInitForApi(publicKey64: Uint8Array) {
-  const stateValue = buildWalletState(publicKey64);
-  return {
-    V1: {
-      code: { AccountId: WALLET_CONTRACT_ACCOUNT_ID },
-      // Empty key → empty base64 string.
-      data: { "": base64.encode(stateValue) },
-    },
-  };
-}
-
-async function createDeterministicAccountViaApi(accountId: string, publicKey64: Uint8Array): Promise<void> {
-  const stateInit = buildStateInitForApi(publicKey64);
-  const resp = await fetch(RELAYER_API_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ accountId, stateInit }),
-  });
-  if (!resp.ok) {
-    let detail = "";
-    try { detail = await resp.text(); } catch {}
-    throw new Error(`Relayer API ${resp.status}: ${detail || resp.statusText}`);
-  }
-}
-
 /**
- * Ensure the wallet-contract account exists on-chain. Tries the hard-coded
- * relayer-signed transaction first; on failure, falls back to the relayer
- * HTTP API. No-op if the account already exists.
+ * Ensure the wallet-contract account exists on-chain, creating it through the
+ * sponsor's `create_deterministic_account`. No-op if the account already exists.
  */
 async function ensureStateInitOnChain(accountId: string, publicKey64: Uint8Array): Promise<void> {
   if (await accountExists(accountId)) return;
-  try {
-    await signAndSendRawTransaction(accountId, [serializeStateInitAction(publicKey64)]);
-    return;
-  } catch (e) {
-    console.warn("Relay via hard-coded account failed; falling back to API:", e);
-  }
-  await createDeterministicAccountViaApi(accountId, publicKey64);
+  await callSponsor(
+    "create_deterministic_account",
+    { state_init: sponsorStateInit(publicKey64) },
+    CREATE_ACCOUNT_GAS,
+  );
 }
 
 // ─── Core EIP-712 Sign + Relay Flow ──────────────────────────────────────────
@@ -758,11 +766,11 @@ async function signWithEip712(ethAddress: string, msg: WalletRequestMessage): Pr
 
 async function signAndRelay(
   accountId: string, publicKey64: Uint8Array, ethAddress: string,
-  request: WalletRequest, network: Network, includeStateInit: boolean,
+  request: WalletRequest, network: Network,
 ): Promise<FinalExecutionOutcome> {
   const msg = buildRequestMessage(accountId, request, network);
   const proof = await signWithEip712(ethAddress, msg);
-  return relayWalletContractCall(accountId, msg, proof, publicKey64, includeStateInit);
+  return relayWalletContractCall(msg, proof, publicKey64);
 }
 
 // ─── NEP-413 Sign Message (via personal_sign + relayer wrap) ─────────────────
@@ -942,8 +950,7 @@ const Eip712Wallet = async () => {
 
   /** Initialise the wallet-contract account on-chain for a freshly recovered
    *  key. On failure, clear the half-written sign-in state so the user is
-   *  never left "signed in" with no usable on-chain account (every later tx
-   *  relays with includeStateInit=false and would otherwise fail forever). */
+   *  never left "signed in" with no usable on-chain account. */
   async function establishOnChain(acct: string, pk: Uint8Array) {
     try {
       await ensureStateInitOnChain(acct, pk);
@@ -1015,7 +1022,7 @@ const Eip712Wallet = async () => {
     }): Promise<FinalExecutionOutcome> {
       if (!isSignedIn()) throw new Error("Wallet not signed in");
       const request: WalletRequest = { ops: [], out: connectorActionsToWalletPromises([{ receiverId, actions }]) };
-      return signAndRelay(accountId!, publicKey64!, ethAddress!, request, network, false);
+      return signAndRelay(accountId!, publicKey64!, ethAddress!, request, network);
     },
 
     async signAndSendTransactions({ transactions, network }: {
@@ -1023,7 +1030,7 @@ const Eip712Wallet = async () => {
     }): Promise<FinalExecutionOutcome[]> {
       if (!isSignedIn()) throw new Error("Wallet not signed in");
       const request: WalletRequest = { ops: [], out: connectorActionsToWalletPromises(transactions) };
-      const result = await signAndRelay(accountId!, publicKey64!, ethAddress!, request, network, false);
+      const result = await signAndRelay(accountId!, publicKey64!, ethAddress!, request, network);
       return transactions.map(() => result);
     },
 
@@ -1038,9 +1045,8 @@ const Eip712Wallet = async () => {
       const msg = buildRequestMessage(accountId!, request, net);
       const proof = await signWithEip712(ethAddress!, msg);
 
-      // The state-init must run via a regular relay before the delegate so
-      // that fallback to the relayer API is available; the delegate itself
-      // can't carry a state-init that would also need fallback handling.
+      // The wallet must exist before the delegate is relayed: the delegate
+      // carries no state init.
       await ensureStateInitOnChain(accountId!, publicKey64!);
       const rawActions: Uint8Array[] = [
         serializeFunctionCallAction("w_execute_signed", { msg, proof }, 300_000_000_000_000n, 1n),
